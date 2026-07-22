@@ -4,6 +4,9 @@ Standalone SvelteKit auth and OAuth 2.1/OIDC provider for Syntax, deployed as a 
 Worker. This service is **auth-only and D1-only**. Its dedicated D1 database is named
 `syntax-auth`.
 
+See [`CONSUMING_AUTH.md`](./CONSUMING_AUTH.md) for reusable agent instructions and the integration
+contract for production and localhost applications.
+
 This project does not connect to, migrate, or modify the Syntax website or the website's
 PostgreSQL database. No existing website, legacy auth, or SynHax users are migrated. A person gets
 a new auth identity in D1 on their first GitHub sign-in.

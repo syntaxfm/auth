@@ -1,11 +1,13 @@
 # Syntax Auth
 
-Standalone SvelteKit auth and OAuth 2.1/OIDC provider for Syntax, deployed as a Cloudflare
-Worker. This service is **auth-only and D1-only**. Its dedicated D1 database is named
-`syntax-auth`.
+Standalone SvelteKit auth and OAuth 2.1/OIDC provider for Syntax, deployed as a Cloudflare Worker.
+Production `*.syntax.fm` applications share the one central Better Auth session from this service;
+they do not create per-app auth or session tables. This service is **auth-only and D1-only**. Its
+dedicated D1 database is named `syntax-auth`.
 
-See [`CONSUMING_AUTH.md`](./CONSUMING_AUTH.md) for reusable agent instructions and the integration
-contract for production and localhost applications.
+**Integrating an app? Read [`CONSUMING_AUTH.md`](./CONSUMING_AUTH.md).** It defines the central
+first-party session contract, trust boundary, safe login return flow, central logout, and the OIDC
+fallback for localhost or external domains.
 
 This project does not connect to, migrate, or modify the Syntax website or the website's
 PostgreSQL database. No existing website, legacy auth, or SynHax users are migrated. A person gets
@@ -35,9 +37,10 @@ The `syntax-auth` D1 database is provisioned in the Syntax Cloudflare account an
    pnpm exec wrangler login
    ```
 
-2. `BETTER_AUTH_URL` and `GITHUB_CLIENT_ID` are committed as non-secret Worker variables in
-   `wrangler.jsonc`. Store only the private values as Worker secrets and generate
-   `BETTER_AUTH_SECRET` with `openssl rand -base64 32`.
+2. `BETTER_AUTH_URL`, `AUTH_COOKIE_DOMAIN`, and `GITHUB_CLIENT_ID` are committed as non-secret
+   Worker variables in `wrangler.jsonc`. Production sets `AUTH_COOKIE_DOMAIN=.syntax.fm` so trusted
+   first-party subdomains receive the central session cookie. Store only the private values as
+   Worker secrets and generate `BETTER_AUTH_SECRET` with `openssl rand -base64 32`.
 
    ```sh
    pnpm exec wrangler secret put BETTER_AUTH_SECRET
@@ -76,6 +79,9 @@ PostgreSQL database.
 
 The Cloudflare adapter supplies `event.platform.env`, including the local `DB` binding and the
 variables from `.dev.vars`. Local D1 data is stored under the ignored `.wrangler/` directory.
+Leave `AUTH_COOKIE_DOMAIN` unset locally: localhost uses a host-only cookie and cannot reproduce
+cross-subdomain sharing. Use a controlled HTTPS Syntax development subdomain/tunnel for identical
+behavior, or use the OIDC fallback documented in `CONSUMING_AUTH.md`.
 
 Useful commands:
 
@@ -93,7 +99,11 @@ pnpm d1:migration:create <migration-name>
 directory without inventing a local SQLite URL or storing Cloudflare credentials. Apply migrations
 with Wrangler's `d1:migrate:local` and `d1:migrate:remote` commands.
 
-## Register an OAuth client
+## Register an OAuth client for fallback consumers
+
+Production first-party `*.syntax.fm` applications use the shared central session and do not need an
+OAuth client. Registration is only for plain localhost or consumers outside `syntax.fm` that use
+the OIDC fallback.
 
 Dynamic and unauthenticated client registration remain disabled. The registration command loads
 the D1 binding through Wrangler's supported platform proxy and calls Better Auth's server-only
@@ -117,9 +127,9 @@ Register against remote D1 after applying the remote migration:
 ```sh
 pnpm oauth:register \
   --remote \
-  --name "Syntax Website" \
-  --redirect-uri "https://syntax.fm/auth/callback" \
-  --post-logout-redirect-uri "https://syntax.fm" \
+  --name "External App" \
+  --redirect-uri "https://example.com/auth/callback" \
+  --post-logout-redirect-uri "https://example.com" \
   --skip-consent \
   --enable-end-session
 ```

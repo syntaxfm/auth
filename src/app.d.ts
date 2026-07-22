@@ -13,6 +13,7 @@ declare global {
 			env: {
 				DB: D1Database;
 				BETTER_AUTH_URL: string;
+				AUTH_COOKIE_DOMAIN?: string;
 				BETTER_AUTH_SECRET: string;
 				GITHUB_CLIENT_ID: string;
 				GITHUB_CLIENT_SECRET: string;

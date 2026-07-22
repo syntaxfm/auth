@@ -8,6 +8,7 @@
 	"routes": [{ "pattern": "auth.syntax.fm", "custom_domain": true }],
 	"vars": {
 		"BETTER_AUTH_URL": "https://auth.syntax.fm",
+		"AUTH_COOKIE_DOMAIN": ".syntax.fm",
 		"GITHUB_CLIENT_ID": "Ov23liaN1JKT8pC8OZg6"
 	},
 	"assets": {

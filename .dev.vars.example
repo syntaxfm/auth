@@ -1,6 +1,9 @@
 # Public origin used by local Better Auth requests.
 BETTER_AUTH_URL=http://localhost:5173
 
+# Leave AUTH_COOKIE_DOMAIN unset on localhost. Local development uses host-only auth cookies;
+# localhost cannot receive the production .syntax.fm cookie.
+
 # Generate a non-production local value with: openssl rand -base64 32
 BETTER_AUTH_SECRET=replace-with-a-local-development-secret
 

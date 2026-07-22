@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { auth_client } from '$lib/auth_client';
 
@@ -12,7 +11,8 @@
 		error_message = '';
 
 		const { error } = await auth_client.signIn.social({
-			provider: 'github'
+			provider: 'github',
+			callbackURL: data.return_to ?? resolve('/')
 		});
 
 		if (error) {
@@ -33,7 +33,7 @@
 			return;
 		}
 
-		await goto(resolve('/sign-in'));
+		window.location.assign(data.return_to ?? resolve('/sign-in'));
 	}
 </script>
 
@@ -46,7 +46,8 @@
 
 	{#if data.user}
 		<p>Signed in as <strong>{data.user.name}</strong>.</p>
-		<p><a href={resolve('/')}>Continue</a></p>
+		<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- validated absolute URL from server load -->
+		<p><a href={data.return_to ?? resolve('/')}>Continue</a></p>
 		<button type="button" onclick={sign_out} disabled={is_submitting}>Sign out</button>
 	{:else}
 		<button type="button" onclick={sign_in} disabled={is_submitting}> Continue with GitHub </button>

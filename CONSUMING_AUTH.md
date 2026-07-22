@@ -1,163 +1,121 @@
 # Consuming Syntax Auth
 
-Use this guide when adding Syntax authentication to any application. It is written to be handed
-directly to a coding agent.
+Production applications on trusted `*.syntax.fm` subdomains share one central Better Auth session
+owned by `https://auth.syntax.fm`. They do not run a second authentication system.
 
-## Provider contract
+## First-party `*.syntax.fm` integration
 
-- Provider: `https://auth.syntax.fm`
+A production Syntax app must not create its own auth, user, account, or session tables. It also must
+not add an OAuth client, OAuth callback handler, or app-specific auth cookie. The browser sends the
+central HttpOnly bearer cookie to every `*.syntax.fm` host, and each app asks Syntax Auth to validate
+it. Better Auth 1.6.23 keeps the cookie `Secure`, `HttpOnly`, and `SameSite=Lax` while setting its
+production domain to `.syntax.fm`.
+
+In server middleware or a server hook, for every request that needs authentication:
+
+1. Read the incoming `Cookie` header without parsing or changing it.
+2. Make a server-to-server request to `https://auth.syntax.fm/api/auth/get-session` with that exact
+   `Cookie` header.
+3. Disable caching with the runtime's `cache: 'no-store'` option and a `Cache-Control: no-store`
+   request header. Never cache the response in a CDN, shared cache, or process-global variable.
+4. Treat a `null`, malformed, or unsuccessful response as signed out.
+5. Copy only the allowed fields below into the framework's per-request context (`locals`, request
+   state, or its equivalent).
+6. If Syntax Auth refreshes cookies in a `Set-Cookie` response, append every header to the browser
+   response unchanged. Preserve separate `Set-Cookie` headers; never comma-join or split them.
+
+The default user fields are:
+
+- `id`: the canonical immutable Syntax identity, equivalent to OIDC `sub`
+- `name`
+- `email`
+- `emailVerified`
+- `image`
+- `createdAt`
+- `updatedAt`
+
+The sanitized session context may contain `id`, `userId`, `expiresAt`, `createdAt`, and `updatedAt`.
+Better Auth also returns the session `token` and may return request metadata such as `ipAddress` and
+`userAgent`; omit those unless server-only application logic genuinely requires the metadata.
+Never put the session token in page data, serialized state, browser JavaScript, logs, analytics, or
+a consumer API response.
+
+Authentication and session validity remain central. Authorization remains app-owned: each app
+decides whether that user is an admin, subscriber, editor, or otherwise allowed to perform an
+action. Store application roles and data against the central user `id`; do not copy central session
+records or provider accounts.
+
+## Sign in and return
+
+Send a signed-out browser to the central sign-in page with its current absolute URL:
+
+```text
+https://auth.syntax.fm/sign-in?return_to=<encoded current app URL>
+```
+
+Build the query with a URL API rather than string concatenation. Syntax Auth accepts only
+`https://syntax.fm` and HTTPS hosts ending exactly in `.syntax.fm`; it rejects credentials,
+non-HTTPS production URLs, external hosts, and deceptive suffixes. An existing valid central
+session returns immediately to the app. Otherwise the same validated URL is used after GitHub sign
+in.
+
+The app must still validate authorization after the user returns. `return_to` proves neither
+identity nor access.
+
+## Central logout
+
+Logout must invalidate the central session and clear the shared cookie. Use one of these flows:
+
+- Send the browser to the existing signed-in surface at `https://auth.syntax.fm/`, where it can sign
+  out centrally.
+- Add a POST action in the consuming app that forwards the incoming `Cookie` and trusted app
+  `Origin` to `POST https://auth.syntax.fm/api/auth/sign-out`, then forwards every returned
+  `Set-Cookie` header to the browser unchanged.
+
+Do not invent a GET logout URL: this service does not implement one, and logout must not be a GET
+side effect. A proxy must preserve multiple `Set-Cookie` values with the runtime's native API and
+must never expose the token while forwarding them.
+
+## Trust boundary
+
+The shared cookie is a bearer credential. Every `*.syntax.fm` server receives it, so every server
+under that parent domain is inside the authentication trust boundary. Only trusted first-party
+applications may use Syntax subdomains. Do not host prototypes, user content, customer apps,
+unreviewed previews, or other untrusted services anywhere under `syntax.fm`.
+
+Compromise of one trusted subdomain can expose the cookie presented to that server. Keep each app
+patched, prevent request/header logging from recording cookies, and remove abandoned subdomains.
+
+## Localhost and external domains
+
+`localhost` cannot receive a `.syntax.fm` cookie. For behavior identical to production, use a
+controlled HTTPS development subdomain or tunnel under `syntax.fm`; because it receives the real
+bearer cookie, it must meet the same first-party trust requirements.
+
+For plain localhost or an app outside `syntax.fm`, use this service's OIDC provider as the fallback:
+
 - Issuer: `https://auth.syntax.fm/api/auth`
 - Discovery: `https://auth.syntax.fm/api/auth/.well-known/openid-configuration`
-- Authorization flow: OAuth 2.1 Authorization Code with PKCE (`S256`)
-- Supported identity scopes: `openid profile email`
-- Optional persistent-access scope: `offline_access`
-- Signing algorithm: EdDSA using the provider's published JWKS
+- Flow: Authorization Code with PKCE (`S256`), state, and nonce
+- Identity scopes: `openid profile email`
 
-Always discover endpoints from the issuer metadata instead of hard-coding authorization, token,
-UserInfo, logout, or JWKS URLs.
-
-## Agent instructions
-
-```text
-Integrate this application with the central Syntax OpenID Connect provider.
-
-Issuer: https://auth.syntax.fm/api/auth
-Discovery: https://auth.syntax.fm/api/auth/.well-known/openid-configuration
-
-Requirements:
-- Use a maintained OAuth 2.1/OpenID Connect client library appropriate for this application's
-  framework. Do not implement OAuth or token verification manually.
-- Use Authorization Code with PKCE S256, state, and OIDC nonce.
-- Validate the ID token signature, issuer, audience, expiration, and nonce.
-- Treat the OIDC `sub` claim as the canonical, immutable Syntax identity. Never use email,
-  username, or display name as an identity key.
-- Store the client secret only in server-side environment variables. Never expose it to browser
-  code, public environment variables, logs, or source control.
-- For a server-rendered application, exchange the authorization code on the server and create an
-  application-owned, host-only, HttpOnly, Secure session cookie.
-- Do not share a `.syntax.fm` cookie, read the auth service's D1 database, or use an auth access
-  token as the application's browser session cookie.
-- Keep application roles and permissions in this application's datastore. Authentication proves
-  identity; it does not automatically grant access.
-- Request only `openid profile email` unless the application genuinely needs refresh tokens. Add
-  `offline_access` only when persistent delegated access is required, and store refresh tokens
-  encrypted at rest.
-- Implement local logout by deleting the application's local session. When global logout is
-  required, use the provider's discovered end-session endpoint and then clear the local session.
-- Fail closed when token validation, state validation, nonce validation, or code exchange fails.
-- Add deterministic tests for callback validation, session creation, unauthorized requests, and
-  logout.
-
-Expected private environment variables:
-AUTH_ISSUER=https://auth.syntax.fm/api/auth
-AUTH_CLIENT_ID=<registered client id>
-AUTH_CLIENT_SECRET=<registered confidential client secret>
-AUTH_REDIRECT_URI=<exact registered callback URL>
-```
-
-Before implementing, inspect the application's existing auth/session conventions and use its
-established library when that library has standards-compliant OIDC support.
-
-## Client registration
-
-Every application and environment must be registered before it can redirect users back from the
-provider. Redirect URIs are exact allowlist entries: scheme, hostname, port, and path must match.
-
-Use separate clients for production and development. This keeps production credentials out of
-local environments and allows either client to be revoked independently.
-
-Register a production server-rendered application from this repository:
-
-```sh
-pnpm oauth:register \
-  --remote \
-  --name "Example App (Production)" \
-  --redirect-uri "https://example.syntax.fm/auth/callback" \
-  --post-logout-redirect-uri "https://example.syntax.fm" \
-  --scope "openid profile email" \
-  --skip-consent \
-  --enable-end-session
-```
-
-Register its local development client against the same production auth server:
-
-```sh
-pnpm oauth:register \
-  --remote \
-  --name "Example App (Local Development)" \
-  --redirect-uri "http://localhost:5173/auth/callback" \
-  --post-logout-redirect-uri "http://localhost:5173" \
-  --scope "openid profile email" \
-  --skip-consent \
-  --enable-end-session
-```
-
-The command prints a confidential client secret once. Put it directly into the consuming
-application's secret manager. Do not paste it into issues, chat, logs, or source files.
-
-Use `--public` only for applications that cannot safely hold a client secret, such as a browser-only
-SPA or native application. Public clients must still use PKCE.
-
-## Localhost behavior
-
-Local applications can use `auth.syntax.fm`. OAuth permits plain HTTP for loopback development
-redirects. The following rules apply:
-
-- Register the exact localhost callback, including its port and path.
-- `localhost` and `127.0.0.1` are different redirect hosts and require separate entries.
-- A different development port requires another registered URI or client.
-- Use the same browser for the local application and `auth.syntax.fm` to receive SSO from the
-  existing central session.
-- The browser will briefly navigate through `auth.syntax.fm` and return to localhost. This is
-  expected and does not require CORS.
-- Token exchange for a confidential client happens from the local application's server, not from
-  browser JavaScript.
-
-The auth server's cookie remains host-only to `auth.syntax.fm`. A local application receives its own
-local session cookie after the OIDC callback.
-
-## Identity and authorization
-
-Persist the OIDC `sub` claim as the cross-property identity reference. A typical application record
-uses a shape such as:
-
-```text
-application_user
-- id
-- auth_user_id  // OIDC sub, unique
-- application-specific profile fields
-```
-
-Do not copy authentication secrets, provider accounts, or central session records into consumer
-databases. Store only the identity reference and application-owned data.
-
-Applications decide their own authorization rules. Signing into Syntax Auth does not imply admin,
-staff, paid, or content-editing access.
-
-## Session expectations
-
-After the callback succeeds, the application should create its own opaque session with:
-
-- A cryptographically random token
-- A server-side expiration
-- Rotation after authentication and privilege changes
-- An HttpOnly, Secure, host-only cookie
-- `SameSite=Lax` unless the application's documented flow requires something else
-- Server-side revocation on logout
-
-Short-lived ID and access tokens are evidence used during the OIDC flow, not replacements for a
-well-scoped application session.
+Use a maintained OIDC client and discover endpoints from metadata. This fallback does not require
+a local user/session table. A server-rendered client can keep the centrally issued short-lived
+token in a host-only HttpOnly cookie and validate or introspect it centrally on requests. Keep the
+token out of browser JavaScript, validate issuer/audience/expiration, and use the OIDC `sub` as the
+same central user ID. Register only the exact callback needed for this localhost or external-domain
+fallback.
 
 ## Acceptance checks
 
-Before considering an integration complete, verify:
+Before considering a first-party integration complete, verify:
 
-1. A signed-out visitor is redirected to `auth.syntax.fm` and can sign in with GitHub.
-2. A visitor already signed into `auth.syntax.fm` returns without another GitHub prompt.
-3. Invalid state, nonce, issuer, audience, signature, and expired-token cases fail closed.
-4. The authorization code cannot be reused.
-5. The resulting local session survives navigation and is unavailable to browser JavaScript.
-6. Local logout revokes the local session.
-7. Global logout uses the discovered end-session endpoint when enabled.
-8. Unauthorized users remain blocked even when they are correctly authenticated.
-9. Both the production callback and the separately registered localhost callback work.
+1. A signed-out request produces an anonymous request context and redirects to the central sign-in
+   URL when the route requires authentication.
+2. A signed-in request forwards the cookie server-to-server with caching disabled and exposes only
+   sanitized user/session fields.
+3. A valid central session returns through `return_to` without another GitHub prompt.
+4. HTTP URLs, credentials, deceptive `syntax.fm` suffixes, and external return hosts are ignored.
+5. App authorization still blocks authenticated users without the required app role.
+6. Central POST sign-out clears the cookie across Syntax apps, with every `Set-Cookie` header
+   preserved.

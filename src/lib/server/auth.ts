@@ -13,6 +13,7 @@ interface CreateAuthOptions {
 
 export function create_auth(env: AuthEnvironment, options: CreateAuthOptions = {}) {
 	const database = drizzle(env.DB, { schema });
+	const better_auth_origin = new URL(env.BETTER_AUTH_URL).origin;
 
 	return betterAuth({
 		appName: 'Syntax',
@@ -25,6 +26,15 @@ export function create_auth(env: AuthEnvironment, options: CreateAuthOptions = {
 		}),
 		disabledPaths: ['/token'],
 		emailAndPassword: options.enable_email_password ? { enabled: true } : undefined,
+		trustedOrigins: ['https://syntax.fm', 'https://*.syntax.fm', better_auth_origin],
+		advanced: env.AUTH_COOKIE_DOMAIN
+			? {
+					crossSubDomainCookies: {
+						enabled: true,
+						domain: env.AUTH_COOKIE_DOMAIN
+					}
+				}
+			: undefined,
 		socialProviders: {
 			github: {
 				clientId: env.GITHUB_CLIENT_ID,

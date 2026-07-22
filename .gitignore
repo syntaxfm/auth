@@ -1,0 +1,12 @@
+node_modules
+.svelte-kit
+.vercel
+.wrangler
+build
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+pnpm-debug.log*
+.DS_Store

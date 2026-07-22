@@ -1,0 +1,64 @@
+:root {
+	font-family:
+		system-ui,
+		-apple-system,
+		sans-serif;
+	color: #171717;
+	background: #f7f7f4;
+	font-synthesis: none;
+}
+
+body {
+	margin: 0;
+}
+
+main {
+	width: min(100% - 2rem, 32rem);
+	margin: 15vh auto 3rem;
+}
+
+h1 {
+	font-size: clamp(2rem, 8vw, 3.5rem);
+	line-height: 1;
+	letter-spacing: -0.04em;
+}
+
+p,
+li,
+button {
+	font-size: 1rem;
+	line-height: 1.5;
+}
+
+a {
+	color: inherit;
+}
+
+form {
+	display: flex;
+	gap: 0.75rem;
+	margin-top: 2rem;
+}
+
+button {
+	padding: 0.65rem 1rem;
+	border: 1px solid #171717;
+	border-radius: 0.3rem;
+	color: #fff;
+	background: #171717;
+	cursor: pointer;
+}
+
+button[value='deny'] {
+	color: #171717;
+	background: transparent;
+}
+
+button:disabled {
+	cursor: wait;
+	opacity: 0.6;
+}
+
+[role='alert'] {
+	color: #9d1c1c;
+}

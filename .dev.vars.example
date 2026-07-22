@@ -1,0 +1,9 @@
+# Public origin used by local Better Auth requests.
+BETTER_AUTH_URL=http://localhost:5173
+
+# Generate a non-production local value with: openssl rand -base64 32
+BETTER_AUTH_SECRET=replace-with-a-local-development-secret
+
+# GitHub OAuth App credentials. Callback: ${BETTER_AUTH_URL}/api/auth/callback/github
+GITHUB_CLIENT_ID=replace-with-a-local-github-client-id
+GITHUB_CLIENT_SECRET=replace-with-a-local-github-client-secret

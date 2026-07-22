@@ -1,0 +1,38 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "syntax-auth",
+	"account_id": "3ebe60b8bb090efeda7702aff60769bb",
+	"main": ".svelte-kit/cloudflare/_worker.js",
+	"compatibility_date": "2026-07-22",
+	"compatibility_flags": ["nodejs_compat"],
+	"routes": [{ "pattern": "auth.syntax.fm", "custom_domain": true }],
+	"vars": {
+		"BETTER_AUTH_URL": "https://auth.syntax.fm",
+		"GITHUB_CLIENT_ID": "Ov23liaN1JKT8pC8OZg6"
+	},
+	"assets": {
+		"binding": "ASSETS",
+		"directory": ".svelte-kit/cloudflare"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "syntax-auth",
+			"database_id": "f4912a0c-c4cd-4f67-b004-2f2d44ffed6a",
+			"migrations_dir": "migrations"
+		}
+	],
+	"env": {
+		"oauth-registration": {
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "syntax-auth",
+					"database_id": "f4912a0c-c4cd-4f67-b004-2f2d44ffed6a",
+					"migrations_dir": "migrations",
+					"remote": true
+				}
+			]
+		}
+	}
+}

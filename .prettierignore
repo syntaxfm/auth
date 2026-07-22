@@ -1,0 +1,7 @@
+.svelte-kit
+.vercel
+.wrangler
+build
+node_modules
+pnpm-lock.yaml
+worker-configuration.d.ts

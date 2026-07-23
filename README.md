@@ -9,6 +9,27 @@ dedicated D1 database is named `syntax-auth`.
 first-party session contract, trust boundary, safe login return flow, central logout, and the OIDC
 fallback for localhost or external domains.
 
+## Consumer agent prompt
+
+Give an agent this single prompt when adding Syntax authentication to another application:
+
+```text
+Integrate this application with Syntax Auth by following the canonical instructions at
+https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md.
+
+Choose the integration mode described there based on where the application runs:
+- For a trusted production application on syntax.fm or *.syntax.fm, use the shared central Better
+  Auth session. Do not create app-local auth, user, account, or session tables; do not add an OAuth
+  client or callback.
+- For plain localhost development or an application outside syntax.fm, use the documented OpenID
+  Connect fallback against https://auth.syntax.fm/api/auth. Do not invent a separate authentication
+  system or persist a second user/session database.
+
+Follow the guide's cookie forwarding, caching, return URL, logout, token handling, authorization,
+trust-boundary, and acceptance-test requirements. Inspect and preserve this application's existing
+framework conventions while treating CONSUMING_AUTH.md as the source of truth for authentication.
+```
+
 This project does not connect to, migrate, or modify the Syntax website or the website's
 PostgreSQL database. No existing website, legacy auth, or SynHax users are migrated. A person gets
 a new auth identity in D1 on their first GitHub sign-in.

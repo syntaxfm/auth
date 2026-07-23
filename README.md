@@ -9,25 +9,46 @@ dedicated D1 database is named `syntax-auth`.
 first-party session contract, trust boundary, safe login return flow, central logout, and the OIDC
 fallback for localhost or external domains.
 
-## Consumer agent prompt
+## Consumer agent prompts
 
-Give an agent this single prompt when adding Syntax authentication to another application:
+### Shared session for `*.syntax.fm`
 
 ```text
 Integrate this application with Syntax Auth by following the canonical instructions at
 https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md.
 
-Choose the integration mode described there based on where the application runs:
-- For a trusted production application on syntax.fm or *.syntax.fm, use the shared central Better
-  Auth session. Do not create app-local auth, user, account, or session tables; do not add an OAuth
-  client or callback.
-- For plain localhost development or an application outside syntax.fm, use the documented OpenID
-  Connect fallback against https://auth.syntax.fm/api/auth. Do not invent a separate authentication
-  system or persist a second user/session database.
+This is a trusted production application on syntax.fm or *.syntax.fm. Use the shared central Better
+Auth session. Do not create app-local auth, user, account, or session tables; do not add an OAuth
+client, callback handler, or app-specific auth cookie.
 
-Follow the guide's cookie forwarding, caching, return URL, logout, token handling, authorization,
-trust-boundary, and acceptance-test requirements. Inspect and preserve this application's existing
-framework conventions while treating CONSUMING_AUTH.md as the source of truth for authentication.
+Forward the shared Better Auth cookie server-to-server to the central get-session endpoint with
+caching disabled, expose only sanitized user/session fields in the per-request context, use the
+validated central return flow for login, and preserve every Set-Cookie header during central logout
+or session refresh.
+
+Follow the guide's trust-boundary, authorization, and acceptance-test requirements. Inspect and
+preserve this application's existing framework conventions while treating CONSUMING_AUTH.md as the
+source of truth for authentication.
+```
+
+### OpenID Connect for localhost or external domains
+
+```text
+Integrate this application with Syntax Auth by following the canonical instructions at
+https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md.
+
+This application runs on plain localhost or outside syntax.fm, so use the documented OpenID Connect
+fallback with issuer https://auth.syntax.fm/api/auth. Use a maintained OIDC client and Authorization
+Code with PKCE S256, state, and nonce. Discover endpoints from provider metadata and use the OIDC
+sub claim as the canonical Syntax user ID.
+
+Do not invent a separate authentication system or persist a second user/session database. Keep the
+centrally issued short-lived token in a host-only HttpOnly cookie, validate or introspect it
+centrally, keep secrets and tokens out of browser JavaScript, and fail closed on validation errors.
+
+Follow the guide's client registration, token handling, authorization, logout, and acceptance-test
+requirements. Inspect and preserve this application's existing framework conventions while treating
+CONSUMING_AUTH.md as the source of truth for authentication.
 ```
 
 This project does not connect to, migrate, or modify the Syntax website or the website's

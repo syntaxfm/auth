@@ -130,7 +130,8 @@ that mode Syntax Auth replaces GitHub with a one-click local developer account (
 `local-developer`), trusts only `localhost` origins, and refuses requests for any other host.
 Deploys use the top-level configuration and never enable local mode.
 
-Consumer apps run the same thing as the `ghcr.io/syntaxfm/auth-local` Docker image, published from
+Consumer apps run the same thing as the private `ghcr.io/syntaxfm/auth-local` Docker image
+(Syntax team only; the plugin signs Docker in with the developer's GitHub CLI login), published from
 `main` by `.github/workflows/local-image.yml` and started by the `packages/auth-local` Vite plugin;
 see `CONSUMING_AUTH.md`. The port lives in `packages/auth-local/index.js`, `vite.config.ts`, and the
 `local` and `oauth-registration` envs in `wrangler.jsonc`.

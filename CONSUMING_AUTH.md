@@ -93,8 +93,11 @@ Syntax Auth on `http://localhost:37960`. Cookies are shared across ports on the 
 host-only cookie reaches the app on any other `localhost` port, and the integration code is
 identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
 
-1. Add the `@syntaxfm/auth-local` dev dependency and its Vite plugin. Docker is the only
-   prerequisite.
+1. Add the `@syntaxfm/auth-local` dev dependency and its Vite plugin. Its Docker image is
+   private to the Syntax team: the plugin signs Docker in with the developer's GitHub CLI login,
+   so each team member needs Docker and, once per machine,
+   `gh auth refresh -h github.com -s read:packages`. Anyone without access still runs the app,
+   signed out.
 
    ```sh
    pnpm add -D "github:syntaxfm/auth#path:/packages/auth-local"
@@ -113,8 +116,8 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    apps may start at once: container changes are serialized by a machine-wide lock that the OS
    releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
-   volume, and skips Vitest. If Docker is missing or another program holds the port, it warns and
-   the app runs signed out. Apps without Vite run the `syntax-auth-local` command before their dev
+   volume, and skips Vitest. If Docker is missing, the image is not accessible, or another program
+   holds the port, it prints one warning and the app runs signed out. Apps without Vite run the `syntax-auth-local` command before their dev
    server instead. Contributors working on Syntax Auth itself run `pnpm dev` in this repository,
    which stops the container and serves the same port; other apps then use that server.
 

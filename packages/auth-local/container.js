@@ -27,19 +27,58 @@ export function warn(message) {
 }
 
 /**
+ * @param {string} command
  * @param {string[]} args
+ * @param {string} [input] written to stdin
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string }>}
  */
-export function docker(args) {
+function run(command, args, input) {
 	return new Promise((resolve) => {
-		const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+		const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 		let stdout = '';
 		let stderr = '';
 		child.stdout.on('data', (chunk) => (stdout += chunk));
 		child.stderr.on('data', (chunk) => (stderr += chunk));
 		child.on('error', (error) => resolve({ code: null, stdout, stderr: error.message }));
 		child.on('close', (code) => resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() }));
+		child.stdin.end(input);
 	});
+}
+
+/** @param {string[]} args */
+export function docker(args) {
+	return run('docker', args);
+}
+
+function is_access_denied(stderr) {
+	return /unauthorized|denied|forbidden/i.test(stderr);
+}
+
+// The image is private to the Syntax team, so reuse the developer's GitHub CLI login for ghcr.io.
+async function login_with_github_cli() {
+	const token = await run('gh', ['auth', 'token', '--hostname', 'github.com']);
+	const user = await run('gh', ['api', 'user', '--jq', '.login']);
+	if (token.code !== 0 || user.code !== 0) return false;
+
+	const login = await run(
+		'docker',
+		['login', 'ghcr.io', '--username', user.stdout, '--password-stdin'],
+		token.stdout
+	);
+	return login.code === 0;
+}
+
+/** @returns {Promise<{ error: string | null, is_denied: boolean }>} */
+export async function pull_image() {
+	let result = await docker(['pull', '--quiet', IMAGE]);
+
+	if (result.code !== 0 && is_access_denied(result.stderr) && (await login_with_github_cli())) {
+		result = await docker(['pull', '--quiet', IMAGE]);
+	}
+
+	return result.code === 0
+		? { error: null, is_denied: false }
+		: { error: result.stderr, is_denied: is_access_denied(result.stderr) };
 }
 
 // True only when Syntax Auth itself answers, never another program that happens to use the port.

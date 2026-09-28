@@ -1,7 +1,7 @@
 import { getPlatformProxy } from 'wrangler';
 
 import { create_auth } from '../src/lib/server/auth';
-import type { AuthEnvironment } from '../src/lib/server/env';
+import { get_auth_environment } from '../src/lib/server/env';
 
 interface RegistrationOptions {
 	name: string;
@@ -76,23 +76,17 @@ function parse_arguments(args: string[]): RegistrationOptions {
 }
 
 const options = parse_arguments(process.argv.slice(2));
-const platform = await getPlatformProxy<AuthEnvironment>({
+const platform = await getPlatformProxy<App.Platform['env']>({
 	configPath: 'wrangler.jsonc',
-	environment: options.is_remote ? 'oauth-registration' : undefined,
+	environment: options.is_remote ? 'oauth-registration' : 'local',
 	persist: true,
 	remoteBindings: options.is_remote
 });
-const environment: AuthEnvironment = {
-	...platform.env,
-	BETTER_AUTH_URL: platform.env.BETTER_AUTH_URL || process.env.BETTER_AUTH_URL || '',
-	BETTER_AUTH_SECRET: platform.env.BETTER_AUTH_SECRET || process.env.BETTER_AUTH_SECRET || '',
-	GITHUB_CLIENT_ID: platform.env.GITHUB_CLIENT_ID || process.env.GITHUB_CLIENT_ID || '',
-	GITHUB_CLIENT_SECRET: platform.env.GITHUB_CLIENT_SECRET || process.env.GITHUB_CLIENT_SECRET || ''
-};
 let registration_user_id: string | undefined;
 
 try {
-	const auth = create_auth(environment, { enable_email_password: true });
+	// Both envs use a loopback URL, so Better Auth runs in local mode with email/password enabled.
+	const auth = create_auth(get_auth_environment(platform.env));
 	const nonce = crypto.randomUUID();
 	const sign_up_response = await auth.api.signUpEmail({
 		asResponse: true,

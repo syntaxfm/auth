@@ -5,6 +5,7 @@ declare global {
 	namespace App {
 		interface Locals {
 			auth: Auth;
+			is_local_development: boolean;
 			session: import('better-auth').Session | null;
 			user: import('better-auth').User | null;
 		}
@@ -14,9 +15,9 @@ declare global {
 				DB: D1Database;
 				BETTER_AUTH_URL: string;
 				AUTH_COOKIE_DOMAIN?: string;
-				BETTER_AUTH_SECRET: string;
-				GITHUB_CLIENT_ID: string;
-				GITHUB_CLIENT_SECRET: string;
+				BETTER_AUTH_SECRET?: string;
+				GITHUB_CLIENT_ID?: string;
+				GITHUB_CLIENT_SECRET?: string;
 			};
 		}
 	}

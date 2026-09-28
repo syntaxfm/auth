@@ -1,0 +1,25 @@
+{
+	"name": "@syntaxfm/auth-local",
+	"version": "1.0.0",
+	"description": "Starts the shared local Syntax Auth container for any Syntax app's dev server.",
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./index.d.ts",
+			"default": "./index.js"
+		}
+	},
+	"bin": {
+		"syntax-auth-local": "./bin.js"
+	},
+	"files": [
+		"index.js",
+		"index.d.ts",
+		"container.js",
+		"update.js",
+		"bin.js"
+	],
+	"engines": {
+		"node": ">=22"
+	}
+}

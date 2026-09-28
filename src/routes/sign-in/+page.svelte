@@ -21,6 +21,29 @@
 		}
 	}
 
+	async function sign_in_local_developer() {
+		if (!data.local_developer) return;
+
+		is_submitting = true;
+		error_message = '';
+
+		const { email, password, name } = data.local_developer;
+		const sign_in_result = await auth_client.signIn.email({ email, password });
+		// The first sign-in on a fresh local database creates the account.
+		const { error } =
+			sign_in_result.error?.status === 401
+				? await auth_client.signUp.email({ email, password, name })
+				: sign_in_result;
+
+		if (error) {
+			error_message = error.message ?? 'Unable to sign in.';
+			is_submitting = false;
+			return;
+		}
+
+		window.location.assign(data.return_to ?? resolve('/'));
+	}
+
 	async function sign_out() {
 		is_submitting = true;
 		error_message = '';
@@ -49,6 +72,10 @@
 		<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- validated absolute URL from server load -->
 		<p><a href={data.return_to ?? resolve('/')}>Continue</a></p>
 		<button type="button" onclick={sign_out} disabled={is_submitting}>Sign out</button>
+	{:else if data.local_developer}
+		<button type="button" onclick={sign_in_local_developer} disabled={is_submitting}>
+			Continue as {data.local_developer.name}
+		</button>
 	{:else}
 		<button type="button" onclick={sign_in} disabled={is_submitting}> Continue with GitHub </button>
 	{/if}

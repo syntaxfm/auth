@@ -6,6 +6,10 @@
 	"compatibility_date": "2026-07-22",
 	"compatibility_flags": ["nodejs_compat"],
 	"routes": [{ "pattern": "auth.syntax.fm", "custom_domain": true }],
+	// Serve production only at auth.syntax.fm: no *.workers.dev address and no per-version preview
+	// URLs, which would run with production secrets and D1.
+	"workers_dev": false,
+	"preview_urls": false,
 	"vars": {
 		"BETTER_AUTH_URL": "https://auth.syntax.fm",
 		"AUTH_COOKIE_DOMAIN": ".syntax.fm",
@@ -24,7 +28,34 @@
 		}
 	],
 	"env": {
+		// Local development only (`pnpm dev`, local migrations, Docker). Never deploy this env: it has
+		// no secrets, a loopback URL, and a database ID that exists only in local Wrangler state.
+		"local": {
+			"routes": [],
+			"workers_dev": false,
+			"vars": {
+				"BETTER_AUTH_URL": "http://localhost:37960",
+				"AUTH_COOKIE_DOMAIN": "",
+				"GITHUB_CLIENT_ID": ""
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "syntax-auth",
+					"database_id": "local-syntax-auth",
+					"migrations_dir": "migrations"
+				}
+			]
+		},
+		// `pnpm oauth:register --remote` only: remote D1 with local, secret-free Better Auth settings.
 		"oauth-registration": {
+			"routes": [],
+			"workers_dev": false,
+			"vars": {
+				"BETTER_AUTH_URL": "http://localhost:37960",
+				"AUTH_COOKIE_DOMAIN": "",
+				"GITHUB_CLIENT_ID": ""
+			},
 			"d1_databases": [
 				{
 					"binding": "DB",

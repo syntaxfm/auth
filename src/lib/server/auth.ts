@@ -6,12 +6,9 @@ import { drizzle } from 'drizzle-orm/d1';
 
 import * as schema from './db/schema';
 import type { AuthEnvironment } from './env';
+import { LOCAL_DEVELOPER } from './local_developer';
 
-interface CreateAuthOptions {
-	enable_email_password?: boolean;
-}
-
-export function create_auth(env: AuthEnvironment, options: CreateAuthOptions = {}) {
+export function create_auth(env: AuthEnvironment) {
 	const database = drizzle(env.DB, { schema });
 	const better_auth_origin = new URL(env.BETTER_AUTH_URL).origin;
 
@@ -25,8 +22,9 @@ export function create_auth(env: AuthEnvironment, options: CreateAuthOptions = {
 			schema
 		}),
 		disabledPaths: ['/token'],
-		emailAndPassword: options.enable_email_password ? { enabled: true } : undefined,
-		trustedOrigins: ['https://syntax.fm', 'https://*.syntax.fm', better_auth_origin],
+		trustedOrigins: env.is_local_development
+			? [better_auth_origin, 'http://localhost:*', 'http://127.0.0.1:*']
+			: ['https://syntax.fm', 'https://*.syntax.fm', better_auth_origin],
 		advanced: env.AUTH_COOKIE_DOMAIN
 			? {
 					crossSubDomainCookies: {
@@ -35,12 +33,29 @@ export function create_auth(env: AuthEnvironment, options: CreateAuthOptions = {
 					}
 				}
 			: undefined,
-		socialProviders: {
-			github: {
-				clientId: env.GITHUB_CLIENT_ID,
-				clientSecret: env.GITHUB_CLIENT_SECRET
-			}
-		},
+		// Locally, email/password backs the one-click developer sign-in instead of GitHub.
+		...(env.is_local_development
+			? {
+					emailAndPassword: { enabled: true },
+					databaseHooks: {
+						user: {
+							create: {
+								before: async (user) =>
+									user.email === LOCAL_DEVELOPER.email
+										? { data: { ...user, id: LOCAL_DEVELOPER.id } }
+										: { data: user }
+							}
+						}
+					}
+				}
+			: {
+					socialProviders: {
+						github: {
+							clientId: env.GITHUB_CLIENT_ID,
+							clientSecret: env.GITHUB_CLIENT_SECRET
+						}
+					}
+				}),
 		plugins: [
 			jwt({
 				disableSettingJwtHeader: true

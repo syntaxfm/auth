@@ -86,25 +86,69 @@ unreviewed previews, or other untrusted services anywhere under `syntax.fm`.
 Compromise of one trusted subdomain can expose the cookie presented to that server. Keep each app
 patched, prevent request/header logging from recording cookies, and remove abandoned subdomains.
 
-## Localhost and external domains
+## Local development
 
-`localhost` cannot receive a `.syntax.fm` cookie. For behavior identical to production, use a
-controlled HTTPS development subdomain or tunnel under `syntax.fm`; because it receives the real
-bearer cookie, it must meet the same first-party trust requirements.
+`localhost` cannot receive the production `.syntax.fm` cookie, so every app runs one shared local
+Syntax Auth on `http://localhost:37960`. Cookies are shared across ports on the same host, so its
+host-only cookie reaches the app on any other `localhost` port, and the integration code is
+identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
 
-For plain localhost or an app outside `syntax.fm`, use this service's OIDC provider as the fallback:
+1. Add the `@syntaxfm/auth-local` dev dependency and its Vite plugin. Docker is the only
+   prerequisite.
+
+   ```sh
+   pnpm add -D "github:syntaxfm/auth#path:/packages/auth-local"
+   ```
+
+   ```ts
+   import { syntax_auth } from '@syntaxfm/auth-local';
+
+   export default defineConfig({
+   	plugins: [syntax_auth(), sveltekit()]
+   });
+   ```
+
+   Every `pnpm dev` then makes sure the one shared `syntax-auth` container is running, whether or
+   not any other Syntax app is already running, without delaying the dev server. Any number of
+   apps may start at once: container changes are serialized by a machine-wide lock that the OS
+   releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
+   images and swaps them in from a detached process, keeps local users and sessions in a Docker
+   volume, and skips Vitest. If Docker is missing or another program holds the port, it warns and
+   the app runs signed out. Apps without Vite run the `syntax-auth-local` command before their dev
+   server instead. Contributors working on Syntax Auth itself run `pnpm dev` in this repository,
+   which stops the container and serves the same port; other apps then use that server.
+
+2. Use `http://localhost:37960` as the Syntax Auth origin in development builds and keep
+   `https://auth.syntax.fm` fixed in code for production builds, so no environment setting can
+   point production elsewhere. Use the origin for `get-session`, `sign-in`, and `sign-out`. Accept
+   `http://localhost` and `http://127.0.0.1` `return_to` and sign-out origins only in development
+   builds.
+3. The app may run on any port. Local Syntax Auth accepts any `http://localhost` or
+   `http://127.0.0.1` port for `return_to`, sign-in, and sign-out.
+4. Sign in with **Continue as Local Developer**. That account always has the central user ID
+   `local-developer`. Make the app's existing local setup (seed, migration, or setup script) give
+   this ID the roles needed for development, idempotently, so no manual step is required.
+   Production never issues this ID.
+
+Local mode turns on only when Syntax Auth runs on a loopback URL without a shared cookie domain. In
+that mode it serves only `localhost` requests, uses its own local D1 state and a development-only
+signing secret, and replaces GitHub with the local developer account. Its sessions are meaningless
+to production. The container publishes its port on `127.0.0.1` only.
+
+## External domains
+
+For an app outside `syntax.fm`, use this service's OIDC provider:
 
 - Issuer: `https://auth.syntax.fm/api/auth`
 - Discovery: `https://auth.syntax.fm/api/auth/.well-known/openid-configuration`
 - Flow: Authorization Code with PKCE (`S256`), state, and nonce
 - Identity scopes: `openid profile email`
 
-Use a maintained OIDC client and discover endpoints from metadata. This fallback does not require
+Use a maintained OIDC client and discover endpoints from metadata. This flow does not require
 a local user/session table. A server-rendered client can keep the centrally issued short-lived
 token in a host-only HttpOnly cookie and validate or introspect it centrally on requests. Keep the
 token out of browser JavaScript, validate issuer/audience/expiration, and use the OIDC `sub` as the
-same central user ID. Register only the exact callback needed for this localhost or external-domain
-fallback.
+same central user ID. Register only the exact callback needed for the external domain.
 
 ## Acceptance checks
 
@@ -119,3 +163,7 @@ Before considering a first-party integration complete, verify:
 5. App authorization still blocks authenticated users without the required app role.
 6. Central POST sign-out clears the cookie across Syntax apps, with every `Set-Cookie` header
    preserved.
+7. On a machine where no other Syntax app is running, `pnpm dev` alone starts local Syntax Auth,
+   and **Continue as Local Developer** returns to the app signed in with its development roles.
+8. A production build uses `https://auth.syntax.fm` and rejects `http://localhost` return and
+   sign-out origins.

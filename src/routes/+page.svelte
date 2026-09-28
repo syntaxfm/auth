@@ -35,7 +35,7 @@
 		<p>Signed in as <strong>{data.user.name}</strong>.</p>
 		<button type="button" onclick={sign_out} disabled={is_submitting}>Sign out</button>
 	{:else}
-		<p><a href={resolve('/sign-in')}>Sign in with GitHub</a></p>
+		<p><a href={resolve('/sign-in')}>Sign in</a></p>
 	{/if}
 
 	{#if error_message}

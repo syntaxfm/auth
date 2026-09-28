@@ -20,9 +20,14 @@ import {
 	with_container_lock
 } from './container.js';
 
-const NO_ACCESS_MESSAGE =
-	'Signed-out mode: local Syntax Auth is for the Syntax team. Team members run ' +
-	'`gh auth refresh -h github.com -s read:packages` once, then restart dev.';
+const ACCESS_MESSAGES = {
+	not_syntax_team:
+		'Running signed out: local Syntax Auth is for the Syntax team, via the GitHub CLI (`gh auth login`).',
+	missing_read_packages:
+		'Running signed out: run `gh auth refresh -h github.com -s read:packages` once, then restart dev.'
+};
+// Returned by ensure_image once it has already explained why the app runs signed out.
+const SIGNED_OUT = 'signed-out';
 const READY_TIMEOUT_MS = 180_000;
 const DOCKER_START_TIMEOUT_MS = 120_000;
 const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
@@ -58,8 +63,12 @@ async function ensure_image() {
 	if ((await docker(['image', 'inspect', IMAGE])).code === 0) return null;
 
 	log('Downloading local Syntax Auth (first run only)');
-	const { error, is_denied } = await pull_image();
-	return is_denied ? NO_ACCESS_MESSAGE : error;
+	const { error, access_problem } = await pull_image();
+	if (access_problem) {
+		warn(ACCESS_MESSAGES[access_problem]);
+		return SIGNED_OUT;
+	}
+	return error;
 }
 
 /** @returns {Promise<string | null>} null when Syntax Auth is running or starting. */
@@ -105,10 +114,7 @@ export async function ensure_syntax_auth() {
 			}
 
 			const error = (await ensure_image()) ?? (await with_container_lock(start_container));
-			if (error === NO_ACCESS_MESSAGE) {
-				warn(error);
-				return;
-			}
+			if (error === SIGNED_OUT) return;
 			if (error) {
 				warn(
 					error.includes('address already in use')

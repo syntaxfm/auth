@@ -1,6 +1,9 @@
 // Docker and locking internals shared by the dev-server entry (index.js) and the detached updater.
 import { spawn } from 'node:child_process';
+import { access, constants, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 
 export const SYNTAX_AUTH_LOCAL_PORT = 37960;
 export const SYNTAX_AUTH_LOCAL_ORIGIN = `http://localhost:${SYNTAX_AUTH_LOCAL_PORT}`;
@@ -29,12 +32,15 @@ export function warn(message) {
 /**
  * @param {string} command
  * @param {string[]} args
- * @param {string} [input] written to stdin
+ * @param {{ input?: string, env?: NodeJS.ProcessEnv }} [options]
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string }>}
  */
-function run(command, args, input) {
+function run(command, args, { input, env } = {}) {
 	return new Promise((resolve) => {
-		const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+		const child = spawn(command, args, {
+			env: env ?? process.env,
+			stdio: ['pipe', 'pipe', 'pipe']
+		});
 		let stdout = '';
 		let stderr = '';
 		child.stdout.on('data', (chunk) => (stdout += chunk));
@@ -54,31 +60,73 @@ function is_access_denied(stderr) {
 	return /unauthorized|denied|forbidden/i.test(stderr);
 }
 
-// The image is private to the Syntax team, so reuse the developer's GitHub CLI login for ghcr.io.
-async function login_with_github_cli() {
-	const token = await run('gh', ['auth', 'token', '--hostname', 'github.com']);
-	const user = await run('gh', ['api', 'user', '--jq', '.login']);
-	if (token.code !== 0 || user.code !== 0) return false;
-
-	const login = await run(
-		'docker',
-		['login', 'ghcr.io', '--username', user.stdout, '--password-stdin'],
-		token.stdout
-	);
-	return login.code === 0;
+async function find_docker_binary() {
+	for (const directory of (process.env.PATH ?? '').split(delimiter)) {
+		const candidate = join(directory, 'docker');
+		try {
+			await access(candidate, constants.X_OK);
+			return candidate;
+		} catch {
+			// Not in this PATH entry.
+		}
+	}
+	return null;
 }
 
-/** @returns {Promise<{ error: string | null, is_denied: boolean }>} */
-export async function pull_image() {
-	let result = await docker(['pull', '--quiet', IMAGE]);
+// The image is private to the Syntax team. For a syntaxfm member, pull once with their GitHub CLI
+// token in a throwaway Docker config. PATH exposes only the docker binary, so Docker cannot fall
+// back to the OS keychain: the token is never saved, and any existing ghcr.io login is untouched.
+/** @returns {Promise<{ code: number | null, stdout: string, stderr: string } | null>} */
+async function pull_as_syntax_team_member() {
+	const membership = await run('gh', ['api', 'user/memberships/orgs/syntaxfm', '--jq', '.state']);
+	if (membership.code !== 0 || membership.stdout !== 'active') return null;
 
-	if (result.code !== 0 && is_access_denied(result.stderr) && (await login_with_github_cli())) {
-		result = await docker(['pull', '--quiet', IMAGE]);
+	const [user, token, context, docker_binary] = await Promise.all([
+		run('gh', ['api', 'user', '--jq', '.login']),
+		run('gh', ['auth', 'token', '--hostname', 'github.com']),
+		docker(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']),
+		find_docker_binary()
+	]);
+	if (user.code !== 0 || token.code !== 0 || context.code !== 0 || !docker_binary) return null;
+
+	const config_directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-config-'));
+	const binary_directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-bin-'));
+	try {
+		await symlink(docker_binary, join(binary_directory, 'docker'));
+		const env = {
+			...process.env,
+			PATH: binary_directory,
+			DOCKER_CONFIG: config_directory,
+			DOCKER_HOST: context.stdout
+		};
+		const login = await run(
+			'docker',
+			['login', 'ghcr.io', '--username', user.stdout, '--password-stdin'],
+			{ input: token.stdout, env }
+		);
+		if (login.code !== 0) return login;
+		return await run('docker', ['pull', '--quiet', IMAGE], { env });
+	} finally {
+		await rm(config_directory, { recursive: true, force: true });
+		await rm(binary_directory, { recursive: true, force: true });
 	}
+}
 
-	return result.code === 0
-		? { error: null, is_denied: false }
-		: { error: result.stderr, is_denied: is_access_denied(result.stderr) };
+/**
+ * @returns {Promise<{ error: string | null, access_problem: 'not_syntax_team' | 'missing_read_packages' | null }>}
+ */
+export async function pull_image() {
+	const result = await docker(['pull', '--quiet', IMAGE]);
+	if (result.code === 0) return { error: null, access_problem: null };
+	if (!is_access_denied(result.stderr)) return { error: result.stderr, access_problem: null };
+
+	const team_result = await pull_as_syntax_team_member();
+	if (!team_result) return { error: result.stderr, access_problem: 'not_syntax_team' };
+	if (team_result.code === 0) return { error: null, access_problem: null };
+
+	return is_access_denied(team_result.stderr)
+		? { error: team_result.stderr, access_problem: 'missing_read_packages' }
+		: { error: team_result.stderr, access_problem: null };
 }
 
 // True only when Syntax Auth itself answers, never another program that happens to use the port.

@@ -93,12 +93,8 @@ Syntax Auth on `http://localhost:37960`. Cookies are shared across ports on the 
 host-only cookie reaches the app on any other `localhost` port, and the integration code is
 identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
 
-1. Add the `@syntaxfm/auth-local` dev dependency and its Vite plugin. Its Docker image is
-   private to the Syntax team. For syntaxfm members, the plugin pulls it with their GitHub CLI
-   login in a throwaway Docker config, so the token is never stored and existing Docker logins are
-   untouched. Each team member needs Docker and a signed-in GitHub CLI (`gh auth login`), plus once
-   per machine `gh auth refresh -h github.com -s read:packages`. Anyone without access still runs
-   the app, signed out.
+1. Add `@syntaxfm/auth-local` as a dev dependency and add its Vite plugin. The package installs
+   from a subdirectory of this repository, which currently requires pnpm:
 
    ```sh
    pnpm add -D "github:syntaxfm/auth#path:/packages/auth-local"
@@ -112,8 +108,8 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    });
    ```
 
-   Every `pnpm dev` then makes sure the one shared `syntax-auth` container is running, whether or
-   not any other Syntax app is already running, without delaying the dev server. Any number of
+   Every dev server start then makes sure the one shared `syntax-auth` container is running,
+   whether or not any other Syntax app is already running, without delaying the dev server. Any number of
    apps may start at once: container changes are serialized by a machine-wide lock that the OS
    releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
@@ -122,6 +118,12 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    `syntax-auth-local` command before their dev server instead. Contributors working on Syntax Auth
    itself run `pnpm dev` in this repository, which stops the container and serves the same port;
    other apps then use that server.
+
+   The Docker image is private to the Syntax team. For syntaxfm members, the plugin pulls it with
+   their GitHub CLI login in a throwaway Docker config, so the token is never stored and existing
+   Docker logins are untouched. Team members need Docker and a signed-in GitHub CLI
+   (`gh auth login`), plus once per machine `gh auth refresh -h github.com -s read:packages`.
+   Anyone without access still runs the app, signed out.
 
 2. Use `http://localhost:37960` as the Syntax Auth origin in development builds and keep
    `https://auth.syntax.fm` fixed in code for production builds, so no environment setting can
@@ -152,8 +154,9 @@ For an app outside `syntax.fm`, use this service's OIDC provider:
 Use a maintained OIDC client and discover endpoints from metadata. This flow does not require
 a local user/session table. A server-rendered client can keep the centrally issued short-lived
 token in a host-only HttpOnly cookie and validate or introspect it centrally on requests. Keep the
-token out of browser JavaScript, validate issuer/audience/expiration, and use the OIDC `sub` as the
-same central user ID. Register only the exact callback needed for the external domain.
+token out of browser JavaScript, validate issuer/audience/expiration, treat any validation or
+introspection failure as signed out, and use the OIDC `sub` as the same central user ID. Do not add a
+second user or session database. Register only the exact callback needed for the external domain.
 
 ## Acceptance checks
 
@@ -168,7 +171,8 @@ Before considering a first-party integration complete, verify:
 5. App authorization still blocks authenticated users without the required app role.
 6. Central POST sign-out clears the cookie across Syntax apps, with every `Set-Cookie` header
    preserved.
-7. On a machine where no other Syntax app is running, `pnpm dev` alone starts local Syntax Auth,
-   and **Continue as Local Developer** returns to the app signed in with its development roles.
+7. On a machine where no other Syntax app is running, the app's dev command alone starts local
+   Syntax Auth, and **Continue as Local Developer** returns to the app signed in with its
+   development roles.
 8. A production build uses `https://auth.syntax.fm` and rejects `http://localhost` return and
    sign-out origins.

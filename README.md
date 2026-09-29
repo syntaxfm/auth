@@ -11,51 +11,25 @@ development against a local Syntax Auth, and the OIDC flow for external domains.
 
 ## Consumer agent prompts
 
-### Shared session for `*.syntax.fm`
+Paste one of these into an agent session in the app being integrated. `CONSUMING_AUTH.md` holds
+every detail, so the prompts only say which case applies.
+
+For an app on `syntax.fm` or a `*.syntax.fm` subdomain:
 
 ```text
-Integrate this application with Syntax Auth by following the canonical instructions at
-https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md.
-
-This is a trusted application on syntax.fm or *.syntax.fm. Use the shared central Better Auth
-session. Do not create app-local auth, user, account, or session tables; do not add an OAuth client,
-callback handler, or app-specific auth cookie.
-
-Forward the shared Better Auth cookie server-to-server to the central get-session endpoint with
-caching disabled, expose only sanitized user/session fields in the per-request context, use the
-validated central return flow for login, and preserve every Set-Cookie header during central logout
-or session refresh.
-
-Local development must work with nothing but `pnpm dev`. Follow the guide's Local development
-section exactly: add the @syntaxfm/auth-local dev dependency and its Vite plugin (or its
-syntax-auth-local command before a non-Vite dev server), use http://localhost:37960 as the Syntax
-Auth origin and accept http://localhost return and sign-out origins in development builds only, keep
-https://auth.syntax.fm fixed for production builds, and make the app's local setup give the central
-user ID local-developer the roles needed to develop.
-
-Follow the guide's trust-boundary, authorization, and acceptance-test requirements. Inspect and
-preserve this application's existing framework conventions while treating CONSUMING_AUTH.md as the
-source of truth for authentication.
+Integrate this app with Syntax Auth by following
+https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md exactly, including its Local
+development section and Acceptance checks. This app runs on syntax.fm or a *.syntax.fm subdomain,
+so use the shared session. Keep this app's existing conventions.
 ```
 
-### OpenID Connect for external domains
+For an app on any other domain:
 
 ```text
-Integrate this application with Syntax Auth by following the canonical instructions at
-https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md.
-
-This application runs outside syntax.fm, so use the documented OpenID Connect
-fallback with issuer https://auth.syntax.fm/api/auth. Use a maintained OIDC client and Authorization
-Code with PKCE S256, state, and nonce. Discover endpoints from provider metadata and use the OIDC
-sub claim as the canonical Syntax user ID.
-
-Do not invent a separate authentication system or persist a second user/session database. Keep the
-centrally issued short-lived token in a host-only HttpOnly cookie, validate or introspect it
-centrally, keep secrets and tokens out of browser JavaScript, and fail closed on validation errors.
-
-Follow the guide's client registration, token handling, authorization, logout, and acceptance-test
-requirements. Inspect and preserve this application's existing framework conventions while treating
-CONSUMING_AUTH.md as the source of truth for authentication.
+Integrate this app with Syntax Auth by following
+https://github.com/syntaxfm/auth/blob/main/CONSUMING_AUTH.md exactly, including its Acceptance
+checks. This app runs outside syntax.fm, so use the External domains (OpenID Connect) flow. Keep
+this app's existing conventions.
 ```
 
 ## What D1 stores

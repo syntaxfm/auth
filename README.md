@@ -58,10 +58,6 @@ requirements. Inspect and preserve this application's existing framework convent
 CONSUMING_AUTH.md as the source of truth for authentication.
 ```
 
-This project does not connect to, migrate, or modify the Syntax website or the website's
-PostgreSQL database. No existing website, legacy auth, or SynHax users are migrated. A person gets
-a new auth identity in D1 on their first GitHub sign-in.
-
 ## What D1 stores
 
 The initial migration creates only the Better Auth and OAuth provider tables:
@@ -112,9 +108,6 @@ The `syntax-auth` D1 database is provisioned in the Syntax Cloudflare account an
    https://auth.syntax.fm/api/auth/callback/github
    ```
 
-Do not run these migrations from the website project and do not point this Worker at the website's
-PostgreSQL database.
-
 ## Local development
 
 ```sh
@@ -123,18 +116,18 @@ pnpm dev
 ```
 
 `pnpm dev` stops the shared `syntax-auth` container if one is running, applies migrations to local
-D1, and serves `http://localhost:37960`. It needs no secrets:
-the Cloudflare adapter reads the committed `local` Wrangler environment, which has a loopback URL,
-no shared cookie domain, and a local-only D1 database under the ignored `.wrangler/` directory. In
-that mode Syntax Auth replaces GitHub with a one-click local developer account (user ID
-`local-developer`), trusts only `localhost` origins, and refuses requests for any other host.
-Deploys use the top-level configuration and never enable local mode.
+D1, and serves `http://localhost:37960`. It needs no secrets: the Cloudflare adapter reads the
+committed `local` Wrangler environment, which has a loopback URL, no shared cookie domain, and a
+local-only D1 database under the ignored `.wrangler/` directory. In that mode Syntax Auth replaces
+GitHub with a one-click local developer account (user ID `local-developer`), trusts only
+`localhost` origins, and refuses requests for any other host. Deploys use the top-level
+configuration and never enable local mode.
 
-Consumer apps run the same thing as the private `ghcr.io/syntaxfm/auth-local` Docker image
-(Syntax team only; the plugin signs Docker in with the developer's GitHub CLI login), published from
-`main` by `.github/workflows/local-image.yml` and started by the `packages/auth-local` Vite plugin;
-see `CONSUMING_AUTH.md`. The port lives in `packages/auth-local/index.js`, `vite.config.ts`, and the
-`local` and `oauth-registration` envs in `wrangler.jsonc`.
+Consumer apps run the same service from the private `ghcr.io/syntaxfm/auth-local` Docker image,
+which `.github/workflows/local-image.yml` publishes from `main`. The `packages/auth-local` Vite
+plugin starts it and, for syntaxfm members, pulls it with their GitHub CLI login without storing
+the token; see `CONSUMING_AUTH.md`. The port lives in `packages/auth-local/container.js`,
+`vite.config.ts`, and the `local` and `oauth-registration` envs in `wrangler.jsonc`.
 
 Useful commands:
 
@@ -164,13 +157,13 @@ the D1 binding through Wrangler's supported platform proxy and calls Better Auth
 the API's authenticated-client-creation requirement, detaches the new client, and deletes the
 temporary user, account, and session in the same command. It does not add an HTTP admin endpoint.
 
-Register against local D1 after applying the local migration:
+Register against local D1 (after `pnpm dev` has applied the local migration):
 
 ```sh
 pnpm oauth:register \
-  --name "Syntax Website" \
-  --redirect-uri "http://localhost:5173/auth/callback" \
-  --post-logout-redirect-uri "http://localhost:5173" \
+  --name "External App (local)" \
+  --redirect-uri "http://localhost:3000/auth/callback" \
+  --post-logout-redirect-uri "http://localhost:3000" \
   --skip-consent \
   --enable-end-session
 ```

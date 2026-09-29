@@ -94,10 +94,11 @@ host-only cookie reaches the app on any other `localhost` port, and the integrat
 identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
 
 1. Add the `@syntaxfm/auth-local` dev dependency and its Vite plugin. Its Docker image is
-   private to the Syntax team: the plugin signs Docker in with the developer's GitHub CLI login,
-   so each team member needs Docker and, once per machine,
-   `gh auth refresh -h github.com -s read:packages`. Anyone without access still runs the app,
-   signed out.
+   private to the Syntax team. For syntaxfm members, the plugin pulls it with their GitHub CLI
+   login in a throwaway Docker config, so the token is never stored and existing Docker logins are
+   untouched. Each team member needs Docker and a signed-in GitHub CLI (`gh auth login`), plus once
+   per machine `gh auth refresh -h github.com -s read:packages`. Anyone without access still runs
+   the app, signed out.
 
    ```sh
    pnpm add -D "github:syntaxfm/auth#path:/packages/auth-local"
@@ -117,9 +118,10 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
    volume, and skips Vitest. If Docker is missing, the image is not accessible, or another program
-   holds the port, it prints one warning and the app runs signed out. Apps without Vite run the `syntax-auth-local` command before their dev
-   server instead. Contributors working on Syntax Auth itself run `pnpm dev` in this repository,
-   which stops the container and serves the same port; other apps then use that server.
+   holds the port, it prints one warning and the app runs signed out. Apps without Vite run the
+   `syntax-auth-local` command before their dev server instead. Contributors working on Syntax Auth
+   itself run `pnpm dev` in this repository, which stops the container and serves the same port;
+   other apps then use that server.
 
 2. Use `http://localhost:37960` as the Syntax Auth origin in development builds and keep
    `https://auth.syntax.fm` fixed in code for production builds, so no environment setting can

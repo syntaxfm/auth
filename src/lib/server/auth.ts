@@ -37,6 +37,10 @@ export function create_auth(env: AuthEnvironment) {
 		...(env.is_local_development
 			? {
 					emailAndPassword: { enabled: true },
+					// Better Auth rate-limits production builds only, and the Docker image serves one.
+					// Locally every app shares one IP-less bucket, so limits would only block repeat
+					// developer sign-ins.
+					rateLimit: { enabled: false },
 					databaseHooks: {
 						user: {
 							create: {

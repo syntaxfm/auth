@@ -113,8 +113,9 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    apps may start at once: container changes are serialized by a machine-wide lock that the OS
    releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
-   volume, and skips Vitest. If Docker is missing, the image is not accessible, or another program
-   holds the port, it prints one warning and the app runs signed out. Apps without Vite run the
+   volume, and skips Vitest. If Docker is missing or stopped, the image is not accessible, or
+   another program holds the port, it prints one warning naming the exact problem and its fix, and
+   the app runs signed out. Apps without Vite run the
    `syntax-auth-local` command before their dev server instead. Contributors working on Syntax Auth
    itself run `pnpm dev` or `pnpm preview` in this repository, which stops the container and serves
    the same port; other apps then use that server. When it stops, it starts the container again.

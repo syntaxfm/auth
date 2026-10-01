@@ -10,9 +10,9 @@ import {
 	with_container_lock
 } from './container.js';
 
-const pull = await pull_image();
+const pull_error = await pull_image();
 
-if (!pull.error) {
+if (!pull_error) {
 	await with_container_lock(async () => {
 		const latest = await docker(['image', 'inspect', '--format', '{{.Id}}', IMAGE]);
 		const state = await get_container_state();

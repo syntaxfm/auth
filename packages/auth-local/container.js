@@ -56,8 +56,33 @@ export function docker(args) {
 	return run('docker', args);
 }
 
+/** @param {{ code: number | null, stderr: string }} result */
+export function is_missing_command(result) {
+	return result.code === null && result.stderr.includes('ENOENT');
+}
+
+/** @param {string} text */
+export function first_line(text) {
+	return text.split('\n').find((line) => line.trim() !== '') ?? text;
+}
+
 function is_access_denied(stderr) {
 	return /unauthorized|denied|forbidden/i.test(stderr);
+}
+
+/** @param {string} login @param {{ stdout: string, stderr: string }} membership */
+function describe_membership_problem(login, membership) {
+	if (membership.stdout === 'pending') {
+		return `GitHub account ${login} has a pending invite to the syntaxfm org. Accept it at https://github.com/orgs/syntaxfm/invitation, then restart dev.`;
+	}
+	// gh adds a misleading admin:org hint to a 404, so check the status before any scope.
+	if (/HTTP 404/.test(membership.stderr)) {
+		return `GitHub account ${login} isn't in the syntaxfm org. If you're on the Syntax team, ask an org owner to add ${login}, then restart dev.`;
+	}
+	if (/read:org/.test(membership.stderr)) {
+		return 'the GitHub CLI needs the read:org scope to check your syntaxfm membership. Run `gh auth refresh -h github.com -s read:org`, then restart dev.';
+	}
+	return `the GitHub CLI couldn't check your syntaxfm membership: ${first_line(membership.stderr)}`;
 }
 
 async function find_docker_binary() {
@@ -76,18 +101,42 @@ async function find_docker_binary() {
 // The image is private to the Syntax team. For a syntaxfm member, pull once with their GitHub CLI
 // token in a throwaway Docker config. PATH exposes only the docker binary, so Docker cannot fall
 // back to the OS keychain: the token is never saved, and any existing ghcr.io login is untouched.
-/** @returns {Promise<{ code: number | null, stdout: string, stderr: string } | null>} */
+// Returns why the app runs signed out (`problem`), or the pull's result.
+/** @returns {Promise<{ problem: string } | { result: { code: number | null, stdout: string, stderr: string } }>} */
 async function pull_as_syntax_team_member() {
-	const membership = await run('gh', ['api', 'user/memberships/orgs/syntaxfm', '--jq', '.state']);
-	if (membership.code !== 0 || membership.stdout !== 'active') return null;
+	const user = await run('gh', ['api', 'user', '--jq', '.login']);
+	if (is_missing_command(user)) {
+		return {
+			problem:
+				"downloading it needs the GitHub CLI, which isn't installed. Install it (`brew install gh`, or see https://cli.github.com), run `gh auth login`, then restart dev."
+		};
+	}
+	if (user.code !== 0) {
+		return {
+			problem: /gh auth login/.test(user.stderr)
+				? "downloading it needs the GitHub CLI signed in, and it isn't. Run `gh auth login`, then restart dev."
+				: `the GitHub CLI couldn't read your GitHub account: ${first_line(user.stderr)}`
+		};
+	}
 
-	const [user, token, context, docker_binary] = await Promise.all([
-		run('gh', ['api', 'user', '--jq', '.login']),
+	const membership = await run('gh', ['api', 'user/memberships/orgs/syntaxfm', '--jq', '.state']);
+	if (membership.code !== 0 || membership.stdout !== 'active') {
+		return { problem: describe_membership_problem(user.stdout, membership) };
+	}
+
+	const [token, context, docker_binary] = await Promise.all([
 		run('gh', ['auth', 'token', '--hostname', 'github.com']),
 		docker(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']),
 		find_docker_binary()
 	]);
-	if (user.code !== 0 || token.code !== 0 || context.code !== 0 || !docker_binary) return null;
+	if (token.code !== 0) {
+		return { problem: `the GitHub CLI couldn't give a token: ${first_line(token.stderr)}` };
+	}
+	if (context.code !== 0 || !docker_binary) {
+		return {
+			problem: `Docker's current context couldn't be read: ${first_line(context.stderr)}`
+		};
+	}
 
 	const config_directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-config-'));
 	const binary_directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-bin-'));
@@ -104,29 +153,44 @@ async function pull_as_syntax_team_member() {
 			['login', 'ghcr.io', '--username', user.stdout, '--password-stdin'],
 			{ input: token.stdout, env }
 		);
-		if (login.code !== 0) return login;
-		return await run('docker', ['pull', '--quiet', IMAGE], { env });
+		if (login.code !== 0) return { result: login };
+		return { result: await run('docker', ['pull', '--quiet', IMAGE], { env }) };
 	} finally {
 		await rm(config_directory, { recursive: true, force: true });
 		await rm(binary_directory, { recursive: true, force: true });
 	}
 }
 
-/**
- * @returns {Promise<{ error: string | null, access_problem: 'not_syntax_team' | 'missing_read_packages' | null }>}
- */
+/** @returns {Promise<string | null>} null once the image is downloaded, otherwise what is wrong. */
 export async function pull_image() {
 	const result = await docker(['pull', '--quiet', IMAGE]);
-	if (result.code === 0) return { error: null, access_problem: null };
-	if (!is_access_denied(result.stderr)) return { error: result.stderr, access_problem: null };
+	if (result.code === 0) return null;
+	if (!is_access_denied(result.stderr)) {
+		return `local Syntax Auth's Docker image couldn't be downloaded: ${first_line(result.stderr)}`;
+	}
 
-	const team_result = await pull_as_syntax_team_member();
-	if (!team_result) return { error: result.stderr, access_problem: 'not_syntax_team' };
-	if (team_result.code === 0) return { error: null, access_problem: null };
+	const team_pull = await pull_as_syntax_team_member();
+	if ('problem' in team_pull) {
+		return `local Syntax Auth's Docker image is private to the Syntax team, and ${team_pull.problem}`;
+	}
+	if (team_pull.result.code === 0) return null;
 
-	return is_access_denied(team_result.stderr)
-		? { error: team_result.stderr, access_problem: 'missing_read_packages' }
-		: { error: team_result.stderr, access_problem: null };
+	return is_access_denied(team_pull.result.stderr)
+		? "your GitHub CLI token can't read the syntaxfm package registry. Run `gh auth refresh -h github.com -s read:packages`, then restart dev."
+		: `local Syntax Auth's Docker image couldn't be downloaded: ${first_line(team_pull.result.stderr)}`;
+}
+
+/** @returns {Promise<string | null>} the program listening on the local port, like "python3 (pid 123)" */
+export async function find_port_holder() {
+	const result = await run('lsof', [
+		'-nP',
+		`-iTCP:${SYNTAX_AUTH_LOCAL_PORT}`,
+		'-sTCP:LISTEN',
+		'-Fpc'
+	]);
+	const pid = result.stdout.match(/^p(\d+)$/m)?.[1];
+	const command = result.stdout.match(/^c(.+)$/m)?.[1];
+	return pid && command ? `${command} (pid ${pid})` : null;
 }
 
 // True only when Syntax Auth itself answers, never another program that happens to use the port.

@@ -90,17 +90,21 @@ pnpm dev
 ```
 
 `pnpm dev` stops the shared `syntax-auth` container if one is running, applies migrations to local
-D1, and serves `http://localhost:37960`. It needs no secrets: the Cloudflare adapter reads the
-committed `local` Wrangler environment, which has a loopback URL, no shared cookie domain, and a
-local-only D1 database under the ignored `.wrangler/` directory. In that mode Syntax Auth replaces
-GitHub with a one-click local developer account (user ID `local-developer`), trusts only
-`localhost` origins, and refuses requests for any other host. Deploys use the top-level
-configuration and never enable local mode.
+D1, and serves `http://localhost:37960`. `pnpm preview` does the same with a production build.
+Both run through `scripts/local_server.js`: however they stop, they stop every process they
+started and start the container again, so other Syntax apps keep signing in. Neither needs
+secrets: the Cloudflare adapter reads the committed `local` Wrangler environment, which has a
+loopback URL, no shared cookie domain, and a local-only D1 database under the ignored `.wrangler/`
+directory. In that mode Syntax Auth replaces GitHub with a one-click local developer account (user
+ID `local-developer`), trusts only `localhost` origins, and refuses requests for any other host.
+Deploys use the top-level configuration and never enable local mode.
 
 Consumer apps run the same service from the private `ghcr.io/syntaxfm/auth-local` Docker image,
-which `.github/workflows/local-image.yml` publishes from `main`. The `packages/auth-local` Vite
-plugin starts it and, for syntaxfm members, pulls it with their GitHub CLI login without storing
-the token; see `CONSUMING_AUTH.md`. The port lives in `packages/auth-local/container.js`,
+which `.github/workflows/local-image.yml` publishes from `main`. The image serves a production
+build with `vite preview`, which watches no files; local mode turns off Better Auth's rate
+limiting, as dev builds always have. The `packages/auth-local` Vite plugin starts it and, for
+syntaxfm members, pulls it with their GitHub CLI login without storing the token; see
+`CONSUMING_AUTH.md`. The port lives in `packages/auth-local/container.js`,
 `vite.config.ts`, and the `local` and `oauth-registration` envs in `wrangler.jsonc`.
 
 Useful commands:

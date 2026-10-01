@@ -4,9 +4,9 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "docker stop syntax-auth >/dev/null 2>&1; pnpm d1:migrate:local && vite dev",
+		"dev": "node scripts/local_server.js dev",
 		"build": "vite build",
-		"preview": "docker stop syntax-auth >/dev/null 2>&1; pnpm build && wrangler dev --env local --ip 127.0.0.1 --port 37960",
+		"preview": "node scripts/local_server.js preview",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write .",

@@ -116,8 +116,8 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    volume, and skips Vitest. If Docker is missing, the image is not accessible, or another program
    holds the port, it prints one warning and the app runs signed out. Apps without Vite run the
    `syntax-auth-local` command before their dev server instead. Contributors working on Syntax Auth
-   itself run `pnpm dev` in this repository, which stops the container and serves the same port;
-   other apps then use that server.
+   itself run `pnpm dev` or `pnpm preview` in this repository, which stops the container and serves
+   the same port; other apps then use that server. When it stops, it starts the container again.
 
    The Docker image is private to the Syntax team. For syntaxfm members, the plugin pulls it with
    their GitHub CLI login in a throwaway Docker config, so the token is never stored and existing

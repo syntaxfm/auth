@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import {
 	CONTAINER_NAME,
 	IMAGE,
+	STARTUP_LIMITS,
+	StalledCommand,
 	SYNTAX_AUTH_LOCAL_ORIGIN,
 	SYNTAX_AUTH_LOCAL_PORT,
 	create_container,
@@ -21,7 +23,8 @@ import {
 	run,
 	sleep,
 	warn,
-	with_container_lock
+	with_container_lock,
+	with_startup_limits
 } from './container.js';
 import { create_plugin } from './plugin.js';
 import { default_setup_deps } from './setup.js';
@@ -36,6 +39,8 @@ const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
  * @property {() => Promise<boolean>} [is_healthy]
  * @property {() => void} [start_updater]
  * @property {(message: string) => void} [warn]
+ * @property {<T>(task: () => Promise<T>) => Promise<T>} [container_lock]
+ * @property {Partial<import('./container.js').StartupLimits>} [limits] see STARTUP_LIMITS
  */
 
 // Downloads the image outside the lock, so a slow first download never makes other apps time out
@@ -112,26 +117,31 @@ async function wait_until_ready(run_command, check) {
 /**
  * @param {import('./container.js').Run} run_command
  * @param {() => Promise<boolean>} check
+ * @param {<T>(task: () => Promise<T>) => Promise<T>} lock
  * @returns {Promise<string | null>} null once Syntax Auth answers, otherwise what is wrong.
  */
-async function start_and_wait(run_command, check) {
-	const error = await with_container_lock(() => start_container(run_command, check));
+async function start_and_wait(run_command, check, lock) {
+	const error = await lock(() => start_container(run_command, check));
 	return error ? describe_start_error(error, run_command) : wait_until_ready(run_command, check);
 }
 
 /**
  * Makes sure the shared local Syntax Auth is running. Never throws. With `can_start: false` (a
  * site's dev server on Linux, or where nobody is at the Mac's screen) it only checks, and says how
- * to start it.
+ * to start it. Every command it runs has a time limit (see STARTUP_LIMITS); one that stalls is
+ * stopped, and the app runs signed out with a message naming it.
  * @param {EnsureOptions} [options]
  */
 export async function ensure_syntax_auth({
 	can_start = true,
-	run: run_command = run,
+	run: unbounded_run = run,
 	is_healthy: check = is_healthy,
 	start_updater: updater = start_updater,
-	warn: report = warn
+	warn: report = warn,
+	container_lock = with_container_lock,
+	limits = {}
 } = {}) {
+	const run_command = with_startup_limits(unbounded_run, { ...STARTUP_LIMITS, ...limits });
 	try {
 		if (!(await check())) {
 			if (!can_start) {
@@ -143,7 +153,7 @@ export async function ensure_syntax_auth({
 			const problem =
 				(await ensure_docker(run_command)) ??
 				(await ensure_image(run_command)) ??
-				(await start_and_wait(run_command, check));
+				(await start_and_wait(run_command, check, container_lock));
 			if (problem) {
 				report(`Running signed out: ${problem}`);
 				return;
@@ -152,6 +162,10 @@ export async function ensure_syntax_auth({
 
 		if (can_start) updater();
 	} catch (error) {
+		if (error instanceof StalledCommand) {
+			report(`Running signed out: ${error.message}`);
+			return;
+		}
 		console.error('Syntax Auth local startup failed', error);
 	}
 }

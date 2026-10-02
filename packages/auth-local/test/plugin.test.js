@@ -299,22 +299,24 @@ test('a wrong option fails at config load with what is wrong', () => {
 });
 
 /**
- * The real ensure_syntax_auth on the stand-in Mac: its commands run through `mac.run`, so a start
- * of Docker or the container shows in `mac.calls`. Only the health check and the updater are
- * stand-ins.
+ * The real ensure_syntax_auth on the stand-in Mac: its commands run through `mac.run` (or `run`),
+ * so a start of Docker or the container shows in `mac.calls`. Only the health check, the updater,
+ * and the container lock (on a free port) are stand-ins.
  * @param {Awaited<ReturnType<typeof create_mac>>} mac
- * @param {boolean} healthy whether local Syntax Auth answers
+ * @param {boolean | (() => boolean)} healthy whether local Syntax Auth answers
+ * @param {import('../container.js').Run} [run]
  */
-function real_ensure(mac, healthy) {
+function real_ensure(mac, healthy, run = mac.run) {
 	const auth = { checks: 0, updaters: 0, /** @type {string[]} */ logs: [] };
 	/** @param {{ can_start?: boolean }} [options] */
 	const ensure = (options) =>
 		ensure_syntax_auth({
 			...options,
-			run: mac.run,
+			run,
+			container_lock: mac.deps.container_lock,
 			is_healthy: async () => {
 				auth.checks++;
-				return healthy;
+				return typeof healthy === 'function' ? healthy() : healthy;
 			},
 			start_updater: () => void auth.updaters++,
 			warn: (message) => void auth.logs.push(message)
@@ -326,10 +328,10 @@ function real_ensure(mac, healthy) {
  * Starts a dev server with the plugin on the stand-in Mac and waits for setup's verdict.
  * @param {Awaited<ReturnType<typeof create_mac>>} mac
  * @param {import('../plugin.js').SyntaxAuthOptions} options
- * @param {{ healthy?: boolean }} [scene]
+ * @param {{ healthy?: boolean | (() => boolean), run?: import('../container.js').Run }} [scene]
  */
-async function start_with_plugin(mac, options, { healthy = true } = {}) {
-	const { auth, ensure } = real_ensure(mac, healthy);
+async function start_with_plugin(mac, options, { healthy = true, run } = {}) {
+	const { auth, ensure } = real_ensure(mac, healthy, run);
 	const deps = fake_deps({ ...mac.deps, ensure_syntax_auth: ensure });
 	const plugin = create_plugin(options, deps);
 	const dev = await start_dev_server(false);
@@ -441,4 +443,109 @@ test("without a name the plugin keeps today's behavior on any platform: it start
 	assert.deepEqual(auth, { checks: 1, updaters: 1, logs: [] });
 	assert.equal(used, 0);
 	assert.deepEqual(mac.calls, []);
+});
+
+/** @param {string} stdout */
+const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
+/** @param {string} stderr */
+const fail = (stderr) => ({ code: 1, stdout: '', stderr });
+
+test("a site's start of local Syntax Auth puts a time limit on every command it runs", async () => {
+	const scenes = [
+		{ name: 'download, then create', image: false, denied: false, container: false },
+		{ name: 'start the stopped container', image: true, denied: false, container: true },
+		{
+			name: 'download as a Syntax team member through gh',
+			image: false,
+			denied: true,
+			container: false
+		}
+	];
+	for (const scene of scenes) {
+		const mac = await create_mac();
+		cleanups.push(() => mac.close());
+		/** @type {{ command: string, timeout_ms?: number, kill_grace_ms?: number }[]} */
+		const recorded = [];
+		let started = false;
+		/** Local Syntax Auth's commands, recorded; setup's own commands still go to `mac.run`. */
+		/** @type {import('../container.js').Run} */
+		const run = async (command, args, options = {}) => {
+			recorded.push({
+				command: `${command} ${args.slice(0, 2).join(' ')}`,
+				timeout_ms: options.timeout_ms,
+				kill_grace_ms: options.kill_grace_ms
+			});
+			const [first, second] = args;
+			if (command === 'gh') {
+				if (second === 'user') return ok('scott');
+				if (second?.startsWith('user/memberships')) return ok('active');
+				return ok('gho_token');
+			}
+			if (command !== 'docker')
+				return { code: null, stdout: '', stderr: `spawn ${command} ENOENT` };
+			if (first === 'info') return ok('29.5.3');
+			if (first === 'context') return ok('unix:///var/run/docker.sock');
+			if (first === 'login') return ok('Login Succeeded');
+			if (first === 'image') return scene.image ? ok() : fail('Error: No such image');
+			if (first === 'pull') {
+				return scene.denied && !options.env ? fail('Error: denied: denied') : ok();
+			}
+			if (first === 'container') {
+				return scene.container
+					? ok('false sha256:old')
+					: fail('Error: No such container: syntax-auth');
+			}
+			if (first === 'run' || first === 'start') {
+				started = true;
+				return ok('container-id');
+			}
+			return fail(`docker ${first} is not set up`);
+		};
+		const { auth } = await start_with_plugin(mac, { name: 'lab' }, { healthy: () => started, run });
+		const deadline = Date.now() + 5_000;
+		while (auth.updaters === 0 && auth.logs.length === 0) {
+			assert.ok(Date.now() < deadline, `${scene.name}: local Syntax Auth's start never finished`);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+
+		const commands = recorded.map((call) => call.command);
+		const expected = {
+			'download, then create': [
+				'docker info --format',
+				'docker image inspect',
+				'docker pull --quiet',
+				'docker container inspect',
+				'docker run --detach'
+			],
+			'start the stopped container': [
+				'docker info --format',
+				'docker image inspect',
+				'docker container inspect',
+				'docker start syntax-auth'
+			],
+			// Then `docker login` and the pull, when this computer has a docker binary on its PATH.
+			'download as a Syntax team member through gh': [
+				'docker info --format',
+				'docker image inspect',
+				'docker pull --quiet',
+				'gh api user',
+				'gh api user/memberships/orgs/syntaxfm',
+				'gh auth token',
+				'docker context inspect'
+			]
+		}[scene.name];
+		assert.deepEqual(commands.slice(0, expected?.length), expected, scene.name);
+		for (const call of recorded) {
+			const limit = /^docker pull/.test(call.command)
+				? 600_000
+				: /^docker (run|start)/.test(call.command)
+					? 120_000
+					: 30_000;
+			assert.deepEqual(
+				{ command: call.command, timeout_ms: call.timeout_ms, kill_grace_ms: call.kill_grace_ms },
+				{ command: call.command, timeout_ms: limit, kill_grace_ms: 2_000 },
+				scene.name
+			);
+		}
+	}
 });

@@ -61,10 +61,15 @@ export function describe_command(command, args) {
  * @param {number} timeout_ms
  */
 export function stall_message(command, args, timeout_ms) {
+	return `\`${describe_command(command, args)}\` didn't finish within ${describe_limit(timeout_ms)}, so setup stopped it`;
+}
+
+/** @param {number} timeout_ms @returns {string} like "30 seconds" or "150 ms" */
+function describe_limit(timeout_ms) {
 	const seconds = Math.round(timeout_ms / 1_000);
-	const limit =
-		timeout_ms >= 1_000 ? `${seconds} ${seconds === 1 ? 'second' : 'seconds'}` : `${timeout_ms} ms`;
-	return `\`${describe_command(command, args)}\` didn't finish within ${limit}, so setup stopped it`;
+	return timeout_ms >= 1_000
+		? `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`
+		: `${timeout_ms} ms`;
 }
 
 /**
@@ -130,6 +135,86 @@ export function run(command, args, { input, env, timeout_ms, kill_grace_ms = KIL
 		});
 		child.stdin.end(input);
 	});
+}
+
+/**
+ * How long each command of local Syntax Auth's startup (ensure_syntax_auth) may run before it gets
+ * SIGTERM, then SIGKILL after `kill_grace_ms`.
+ * - `inspect_ms`, 30 seconds: reading Docker's state (`docker info`, `docker context inspect`,
+ *   `docker image inspect`, `docker container inspect`, `docker logs`), opening the Docker app,
+ *   `gh`, `docker login`, and `lsof` answer within seconds when they work, so 30 means stuck.
+ * - `download_ms`, 10 minutes: `docker pull` of the image, which the first run downloads whole;
+ *   room for a slow connection.
+ * - `start_ms`, 2 minutes: `docker run` and `docker start` of the container, which may first wait
+ *   for Docker to create the volume and set up the port forward on a busy Docker VM.
+ * @typedef {{ inspect_ms: number, download_ms: number, start_ms: number, kill_grace_ms: number }} StartupLimits
+ */
+/** @type {StartupLimits} */
+export const STARTUP_LIMITS = {
+	inspect_ms: 30_000,
+	download_ms: 600_000,
+	start_ms: 120_000,
+	kill_grace_ms: KILL_GRACE_MS
+};
+
+/** A startup command ran past its limit; the message names it and says what to do. */
+export class StalledCommand extends Error {}
+
+/**
+ * The limit for one startup command, and what to do when it stalls.
+ * @param {string} command
+ * @param {string[]} args
+ * @param {StartupLimits} limits
+ * @returns {{ timeout_ms: number, fix: string }}
+ */
+function startup_limit(command, args, limits) {
+	if (command === 'docker' && args[0] === 'pull') {
+		return {
+			timeout_ms: limits.download_ms,
+			fix: 'The download is stuck or too slow. Check your internet connection, then restart dev.'
+		};
+	}
+	if (command === 'docker' && (args[0] === 'run' || args[0] === 'start')) {
+		return {
+			timeout_ms: limits.start_ms,
+			fix: `Docker is stuck starting the ${CONTAINER_NAME} container. Check Docker Desktop or OrbStack for an error or a prompt (or restart your Docker engine), then restart dev.`
+		};
+	}
+	const fixes = {
+		login: "ghcr.io isn't answering. Check your internet connection, then restart dev.",
+		docker:
+			"Docker isn't answering. Quit and reopen Docker Desktop or OrbStack (or restart your Docker engine), then restart dev.",
+		gh: "The GitHub CLI isn't answering. Check your internet connection and `gh auth status`, then restart dev.",
+		open: "macOS didn't finish opening the Docker app. Open Docker Desktop or OrbStack yourself, then restart dev.",
+		lsof: `Find and stop the program using port ${SYNTAX_AUTH_LOCAL_PORT}, then restart dev.`
+	};
+	const key = command === 'docker' && args[0] === 'login' ? 'login' : command;
+	return {
+		timeout_ms: limits.inspect_ms,
+		fix: key in fixes ? fixes[/** @type {keyof typeof fixes} */ (key)] : 'Restart dev to try again.'
+	};
+}
+
+/**
+ * `run_command` with a limit on every command (see StartupLimits). A command that stalls is stopped
+ * and throws StalledCommand naming it.
+ * @param {Run} run_command
+ * @param {StartupLimits} [limits]
+ * @returns {Run}
+ */
+export function with_startup_limits(run_command, limits = STARTUP_LIMITS) {
+	return async (command, args, options = {}) => {
+		const { timeout_ms, fix } = startup_limit(command, args, limits);
+		const result = await run_command(command, args, {
+			...options,
+			timeout_ms,
+			kill_grace_ms: limits.kill_grace_ms
+		});
+		if (!result.timed_out) return result;
+		throw new StalledCommand(
+			`\`${describe_command(command, args)}\` didn't finish within ${describe_limit(timeout_ms)}, so local Syntax Auth's startup stopped it. ${fix}`
+		);
+	};
 }
 
 /** @param {string[]} args @param {Run} [run_command] */
@@ -498,7 +583,13 @@ export function with_container_lock(task) {
 
 /** @param {Run} run_command */
 async function is_docker_running(run_command) {
-	return (await run_command('docker', ['info', '--format', '{{.ServerVersion}}'])).code === 0;
+	try {
+		return (await run_command('docker', ['info', '--format', '{{.ServerVersion}}'])).code === 0;
+	} catch (error) {
+		// While Docker starts, a stalled check only means not ready yet; the 2-minute wait decides.
+		if (error instanceof StalledCommand) return false;
+		throw error;
+	}
 }
 
 // On macOS, opens the Docker app that Docker's current context points at, then waits for it.

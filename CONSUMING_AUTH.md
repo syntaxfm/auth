@@ -140,10 +140,14 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    Production never issues this ID.
 
 Local mode turns on only when Syntax Auth runs on a loopback URL without a shared cookie domain. In
-that mode it answers only `localhost` and `auth.syntax.test`, uses its own local D1 state and a
-development-only signing secret, and replaces GitHub with the local developer account. Any other
-host gets a 403 that names the host and the two addresses to use instead. Its sessions are
-meaningless to production. The container publishes its port on `127.0.0.1` only.
+that mode it answers only `localhost`, `127.0.0.1`, `[::1]`, and `auth.syntax.test`, uses its own
+local D1 state and a development-only signing secret, and replaces GitHub with the local developer
+account. In the container, and under `pnpm dev` in this repository, every request for any other
+host, including `/api/health` and built files, gets a plain-text 403 that names the host and the
+two addresses to use instead. A request from an origin it doesn't trust gets a 403 with code
+`INVALID_ORIGIN` and a message naming that origin and the origins it accepts:
+`http://localhost:<port>`, `http://127.0.0.1:<port>`, `https://syntax.test`, and
+`https://*.syntax.test`. Its sessions are meaningless to production. The container publishes its port on `127.0.0.1` only.
 
 ### Local HTTPS names
 

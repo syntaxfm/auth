@@ -263,8 +263,10 @@ async function wait_until_healthy() {
 	);
 }
 
+// vite.config.ts imports from src.
 const LINKED_FILES = [
 	'node_modules',
+	'src',
 	'.svelte-kit',
 	'package.json',
 	'vite.config.ts',
@@ -322,6 +324,17 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 	process.once(signal, () => void clean_up().finally(() => process.exit(1)));
 }
 
+function assert_host_refused(reply: Reply, host: string, what: string) {
+	const hostname = new URL(`http://${host}`).hostname;
+	assert.equal(reply.status, 403, what);
+	assert.equal(reply.headers['content-type'], 'text/plain; charset=utf-8', what);
+	assert.equal(
+		reply.body,
+		`Local Syntax Auth answers only localhost and auth.syntax.test, so it refused this request for "${hostname}". Open ${loopback_origin} or https://auth.syntax.test instead.`,
+		what
+	);
+}
+
 test('local mode refuses every host but localhost and auth.syntax.test, naming the host', async () => {
 	for (const host of [
 		'example.com',
@@ -333,12 +346,37 @@ test('local mode refuses every host but localhost and auth.syntax.test, naming t
 			host,
 			headers: { cookie: `${SYNTAX_TEST_SESSION_COOKIE}=forwarded.cookie` }
 		});
-		assert.equal(reply.status, 403, host);
-		assert.equal(reply.headers['content-type'], 'text/plain; charset=utf-8');
-		assert.equal(
-			reply.body,
-			`Local Syntax Auth answers only localhost and auth.syntax.test, so it refused this request for "${host}". Open ${loopback_origin} or https://auth.syntax.test instead.`
-		);
+		assert_host_refused(reply, host, host);
+	}
+});
+
+// A page in another tab can point its own name at 127.0.0.1 (DNS rebinding), so health checks and
+// built files must be refused for it too, though Vite answers them before SvelteKit's hook.
+test('other hosts get the same 403 for health checks, built files, and pages', async () => {
+	const page = await send('/sign-in', { host: loopback_host });
+	assert.equal(page.status, 200, page.body);
+	const asset = page.body.match(/_app\/immutable\/assets\/[^"'?]+\.css/)?.[0];
+	assert.ok(asset, `The sign-in page links no built CSS file:\n${page.body}`);
+	const paths = ['/api/health', '/_app/version.json', `/${asset}`, '/sign-in'];
+
+	// Vite's own host check would let the IP address and the *.localhost name through.
+	for (const host of ['evil.example', `evil.example:${port}`, '10.0.0.1', 'evil.localhost']) {
+		for (const path of paths) {
+			assert_host_refused(await send(path, { host }), host, `${host}${path}`);
+		}
+	}
+
+	for (const host of [
+		loopback_host,
+		'localhost',
+		`127.0.0.1:${port}`,
+		`[::1]:${port}`,
+		SYNTAX_TEST_HOST
+	]) {
+		for (const path of paths) {
+			const reply = await send(path, { host });
+			assert.equal(reply.status, 200, `${host}${path}: ${reply.body.slice(0, 500)}`);
+		}
 	}
 });
 
@@ -425,7 +463,11 @@ test('app servers on localhost sign out a .syntax.test session only for syntax.t
 		'https://lab.syntax.test.example.com'
 	);
 	assert.equal(look_alike.status, 403);
-	assert.equal(JSON.parse(look_alike.body).code, 'INVALID_ORIGIN');
+	assert.deepEqual(JSON.parse(look_alike.body), {
+		code: 'INVALID_ORIGIN',
+		message:
+			'Local Syntax Auth refused a request from origin "https://lab.syntax.test.example.com": it accepts only http://localhost:<port>, http://127.0.0.1:<port>, https://syntax.test, and https://*.syntax.test. Open the app at one of those addresses.'
+	});
 	assert.equal(
 		(await get_session_user_id(loopback_host, syntax_test_cookie)).user_id,
 		LOCAL_DEVELOPER.id,
@@ -455,6 +497,20 @@ test('a session made on localhost still validates and signs out', async () => {
 		(await get_session_user_id(loopback_host, loopback_cookie)).user_id,
 		LOCAL_DEVELOPER.id
 	);
+
+	const look_alike = await post_json(
+		'/api/auth/sign-out',
+		loopback_host,
+		'http://localhost.example.com:3000',
+		{},
+		loopback_cookie
+	);
+	assert.equal(look_alike.status, 403);
+	assert.deepEqual(JSON.parse(look_alike.body), {
+		code: 'INVALID_ORIGIN',
+		message:
+			'Local Syntax Auth refused a request from origin "http://localhost.example.com:3000": it accepts only http://localhost:<port>, http://127.0.0.1:<port>, https://syntax.test, and https://*.syntax.test. Open the app at one of those addresses.'
+	});
 
 	const reply = await post_json(
 		'/api/auth/sign-out',

@@ -1,5 +1,35 @@
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig, type Connect, type Plugin } from 'vite';
+
+import {
+	SYNTAX_TEST_AUTH_HOSTNAME,
+	get_host_header_hostname,
+	is_local_hostname,
+	local_host_refusal
+} from './src/lib/utils/local_hosts';
+
+// `vite dev` and `vite preview` (the Docker image) serve local Syntax Auth. They answer health
+// checks and built files before src/hooks.server.ts runs, and Vite's own host check lets through
+// any IP address and *.localhost, so this refuses every other host first, with the hook's text.
+// Deploys run on Cloudflare Workers without Vite; the hook still checks every other request.
+function refuse_other_hosts(): Plugin {
+	const refuse: Connect.NextHandleFunction = (request, response, next) => {
+		const hostname = get_host_header_hostname(request.headers.host);
+		if (is_local_hostname(hostname)) return next();
+
+		response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+		response.end(local_host_refusal(hostname, `http://localhost:${request.socket.localPort}`));
+	};
+	// Vite adds its host check before any plugin's middleware, so this goes in front of it.
+	const add_first = (middlewares: Connect.Server) =>
+		middlewares.stack.unshift({ route: '', handle: refuse });
+
+	return {
+		name: 'syntax-auth-refuse-other-hosts',
+		configureServer: (server) => void add_first(server.middlewares),
+		configurePreviewServer: (server) => void add_first(server.middlewares)
+	};
+}
 
 export default defineConfig({
 	// Consumer apps point at this exact port; keep it in sync with packages/auth-local.
@@ -9,13 +39,10 @@ export default defineConfig({
 		port: 37960,
 		strictPort: true,
 		// The local HTTPS proxy forwards this name to Syntax Auth.
-		allowedHosts: ['auth.syntax.test']
+		allowedHosts: [SYNTAX_TEST_AUTH_HOSTNAME]
 	},
 	preview: {
-		// `vite preview` serves the Docker image. Its host check would refuse other names with advice
-		// to edit this file, so let them reach src/hooks.server.ts, which refuses every host but
-		// localhost and auth.syntax.test before any page or auth route and names the right address.
-		allowedHosts: true
+		allowedHosts: [SYNTAX_TEST_AUTH_HOSTNAME]
 	},
-	plugins: [sveltekit()]
+	plugins: [refuse_other_hosts(), sveltekit()]
 });

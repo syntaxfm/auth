@@ -99,8 +99,14 @@ directory. In that mode Syntax Auth replaces GitHub with a one-click local devel
 ID `local-developer`) and answers only `localhost` and `auth.syntax.test`, the local HTTPS name
 that apps on `https://syntax.test` and `https://*.syntax.test` send browsers to. On
 `auth.syntax.test`, and on app servers' `localhost` calls that forward its cookie, sessions use the
-shared `.syntax.test` cookie described in `CONSUMING_AUTH.md`. Any other host gets a 403 naming
-the host.
+shared `.syntax.test` cookie described in `CONSUMING_AUTH.md`. Under `vite dev` (`pnpm dev`) and
+`vite preview` (the Docker image), a plugin in `vite.config.ts` answers every request for any other
+host, including `/api/health` and built files, with a plain-text 403 naming the host and the two
+addresses to use, before Vite's own host check or file serving. `src/hooks.server.ts` refuses
+other hosts the same way for every page and auth route, so `wrangler dev` (`pnpm preview`), which
+skips the Vite plugin, still refuses them there; it serves `/api/health` and built files to any
+host. In local mode, a request from an origin local Syntax Auth doesn't trust gets Better Auth's
+403 `INVALID_ORIGIN` with a message naming the origin and the origins it accepts.
 Deploys use the top-level configuration and never enable local mode.
 
 Consumer apps run the same service from the private `ghcr.io/syntaxfm/auth-local` Docker image,

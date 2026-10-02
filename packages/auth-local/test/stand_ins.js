@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { ensure_docker, run as real_run, stall_message, with_port_lock } from '../container.js';
+import { why_not_open } from '../setup.js';
 
 const FIXTURES = new URL('./fixtures/', import.meta.url);
 /** @param {string} name */
@@ -353,6 +354,8 @@ export function create_run() {
 		processes: new Map(),
 		keychain: { certificates: new Set(), trusted: new Set() },
 		docker_installed: true,
+		/** Whether the Docker engine answers `docker info`. */
+		docker_running: true,
 		/** @type {null | { running: boolean, image: string, admin_port: number }} */
 		container: null,
 		/** @type {(args: string[]) => Promise<{ code: number | null, stdout: string, stderr: string }>} */
@@ -450,7 +453,12 @@ export function create_run() {
 		}
 		if (command === 'docker') {
 			if (!state.docker_installed) return { code: null, stdout: '', stderr: 'spawn docker ENOENT' };
-			if (args[0] === 'info') return ok('29.5.3');
+			if (args[0] === 'info') {
+				return state.docker_running
+					? ok('29.5.3')
+					: fail('Cannot connect to the Docker daemon at unix:///var/run/docker.sock.');
+			}
+			if (args[0] === 'context') return ok('unix:///Users/test/.docker/run/docker.sock');
 			if (args[0] === 'image') return ok();
 			if (args[0] === 'container' && args[1] === 'inspect') {
 				const container = state.container;
@@ -551,7 +559,8 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 		ensure_docker: (run_command) =>
 			ensure_docker(run_command, {
 				...docker_start,
-				lock: (task) => with_port_lock(container_lock_port, task)
+				lock: (task) => with_port_lock(container_lock_port, task),
+				why_not_open: () => why_not_open({ run: run_command, env: deps.env })
 			}),
 		log: (message) => logs.push(message),
 		warn: (message) => logs.push(message),

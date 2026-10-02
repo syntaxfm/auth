@@ -79,6 +79,16 @@ function describe_limit(timeout_ms) {
 		: `${timeout_ms} ms`;
 }
 
+/**
+ * Whether `name` is set at all in `env`. A marker like CI or PI_CODING_AGENT counts whatever its
+ * value, even "", "0", or "false": only an unset variable means it isn't there.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string} name
+ */
+export function is_set(env, name) {
+	return env[name] !== undefined;
+}
+
 // The read-only `security` subcommands; every other one can change the keychain or show a dialog.
 const READ_ONLY_SECURITY = new Set(['verify-cert', 'find-certificate']);
 
@@ -91,7 +101,7 @@ const READ_ONLY_SECURITY = new Set(['verify-cert', 'find-certificate']);
  * @param {NodeJS.ProcessEnv} env
  */
 export function refused_under_tests(command, args, env) {
-	const runner = env.NODE_TEST_CONTEXT ? 'NODE_TEST_CONTEXT' : env.VITEST ? 'VITEST' : null;
+	const runner = ['NODE_TEST_CONTEXT', 'VITEST'].find((name) => is_set(env, name));
 	if (!runner) return null;
 	const name = basename(command);
 	const is_refused =
@@ -633,8 +643,12 @@ async function is_docker_running(run_command) {
  * @property {string} result_path where the last start's outcome is kept for those that waited
  * @property {number} ready_timeout_ms how long the opened app may take to answer
  * @property {number} poll_ms
+ * @property {() => Promise<string | null>} why_not_open null when the Docker app may be opened (a
+ *   person is at this Mac's screen); otherwise where this run started, like "from an agent shell
+ *   (PI_CODING_AGENT)" (see setup.js's check_presence). Docker Desktop's first run and its
+ *   privileged helper can show dialogs, so nothing opens it where nobody can answer them.
  */
-/** @type {DockerStartOptions} */
+/** @type {Omit<DockerStartOptions, 'why_not_open'>} */
 export const DOCKER_START = {
 	lock: with_container_lock,
 	platform: process.platform,
@@ -697,9 +711,10 @@ async function start_docker_app(run_command, { ready_timeout_ms, poll_ms }) {
 
 /**
  * Opens the Docker app at most once at a time on this Mac: two app instances opening it together
- * crash Docker Desktop. The start runs under the container lock; an instance that waited for it
- * re-checks Docker, and when the start it waited for failed, gives that start's message instead of
- * opening the app again.
+ * crash Docker Desktop. The start runs under the container lock and keeps its outcome, a stalled or
+ * failed command included, before letting go of it; an instance that waited for it re-checks
+ * Docker, and when the start it waited for failed, gives that start's message instead of opening
+ * the app again.
  * @param {Run} run_command
  * @param {DockerStartOptions} options
  * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
@@ -711,23 +726,32 @@ async function start_docker_app_once(run_command, options) {
 		const waited_for = await read_start_result(options.result_path, asked_at);
 		if (waited_for?.problem) return waited_for.problem;
 
-		const problem = await start_docker_app(run_command, options);
-		await writeFile(
-			options.result_path,
-			JSON.stringify({ finished_at: Date.now(), problem })
-		).catch(() => {
-			// Only those waiting read it; without it, the next one opens the app itself.
-		});
-		return problem;
+		/** @param {string | null} problem */
+		const keep = (problem) =>
+			writeFile(options.result_path, JSON.stringify({ finished_at: Date.now(), problem })).catch(
+				() => {
+					// Only those waiting read it; without it, the next one opens the app itself.
+				}
+			);
+		try {
+			const problem = await start_docker_app(run_command, options);
+			await keep(problem);
+			return problem;
+		} catch (error) {
+			await keep(error instanceof Error ? error.message : String(error));
+			throw error;
+		}
 	});
 }
 
 /**
- * @param {Run} [run_command]
- * @param {Partial<DockerStartOptions>} [start_options] see DOCKER_START
+ * Docker running, or why not. On a Mac it opens Docker Desktop or OrbStack only when
+ * `why_not_open` says a person is at the screen; otherwise it says why it didn't.
+ * @param {Run} run_command
+ * @param {Partial<DockerStartOptions> & Pick<DockerStartOptions, 'why_not_open'>} start_options see DOCKER_START
  * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
  */
-export async function ensure_docker(run_command = run, start_options = {}) {
+export async function ensure_docker(run_command, start_options) {
 	const options = { ...DOCKER_START, ...start_options };
 	const info = await run_command('docker', ['info', '--format', '{{.ServerVersion}}']);
 	if (info.code === 0) return null;
@@ -737,6 +761,12 @@ export async function ensure_docker(run_command = run, start_options = {}) {
 	if (/permission denied/i.test(info.stderr)) {
 		return `Docker is installed, but your user can't use it (${first_line(info.stderr)}). On Linux, add yourself to the docker group (https://docs.docker.com/engine/install/linux-postinstall/), then restart dev.`;
 	}
-	if (options.platform === 'darwin') return start_docker_app_once(run_command, options);
+	if (options.platform === 'darwin') {
+		const where = await options.why_not_open();
+		if (where) {
+			return `Docker isn't running, and this dev server was started ${where}, so it didn't open Docker Desktop or OrbStack. Start Docker Desktop (or OrbStack), then restart dev.`;
+		}
+		return start_docker_app_once(run_command, options);
+	}
 	return `Docker is installed but not running (${first_line(info.stderr)}). Start it (for example \`sudo systemctl start docker\`), then restart dev.`;
 }

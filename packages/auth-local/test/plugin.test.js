@@ -445,6 +445,41 @@ test('from an agent shell, a dev start shows no dialog and says why first, yet s
 	assert.deepEqual(auth, { checks: 1, updaters: 1, logs: [] });
 });
 
+test("from an agent shell, a dev start whose Docker isn't running never opens Docker Desktop or OrbStack, with a name or without", async () => {
+	const message =
+		"Running signed out: Docker isn't running, and this dev server was started from an agent shell (PI_CODING_AGENT), so it didn't open Docker Desktop or OrbStack. Start Docker Desktop (or OrbStack), then restart dev.";
+	for (const options of [{ name: /** @type {const} */ ('lab') }, {}]) {
+		const mac = await create_mac();
+		cleanups.push(() => mac.close());
+		mac.deps.env = { PI_CODING_AGENT: 'true' };
+		mac.state.docker_running = false;
+		const { auth, ensure } = real_ensure(mac, false);
+		const plugin = create_plugin(options, fake_deps({ ...mac.deps, ensure_syntax_auth: ensure }));
+		plugin.configureServer({ middlewares: { use: () => {} }, httpServer: null });
+		const deadline = Date.now() + 5_000;
+		while (auth.logs.length === 0) {
+			assert.ok(Date.now() < deadline, 'local Syntax Auth never reported');
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.deepEqual(auth, { checks: 1, updaters: 0, logs: [message] }, JSON.stringify(options));
+		assert.deepEqual(
+			mac.commands().filter((command) => /^open |^docker (run|start|pull)/.test(command)),
+			[],
+			JSON.stringify(options)
+		);
+	}
+});
+
+test('a test runner marker set to an empty string still keeps the plugin from doing anything', async () => {
+	const deps = fake_deps({ env: { VITEST: '' } });
+	const plugin = create_plugin({ name: 'lab' }, deps);
+	assert.equal(plugin.config({}), undefined);
+	let used = 0;
+	plugin.configureServer({ middlewares: { use: () => used++ }, httpServer: null });
+	assert.equal(used, 0);
+	assert.equal(deps.ensured, 0);
+});
+
 test("without a name the plugin keeps today's behavior on any platform: it starts local Syntax Auth", async () => {
 	const mac = await create_mac();
 	cleanups.push(() => mac.close());
@@ -465,7 +500,7 @@ test("without a name the plugin keeps today's behavior on any platform: it start
 	let used = 0;
 	plugin.configureServer({ middlewares: { use: () => used++ }, httpServer: null });
 	await new Promise((resolve) => setTimeout(resolve, 50));
-	assert.deepEqual(received, [undefined]);
+	assert.deepEqual(received, [{ env: {} }]);
 	assert.deepEqual(auth, { checks: 1, updaters: 1, logs: [] });
 	assert.equal(used, 0);
 	assert.deepEqual(mac.calls, []);

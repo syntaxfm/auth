@@ -14,6 +14,7 @@ import {
 	is_site_name,
 	site_url
 } from './names.js';
+import { is_set } from './container.js';
 import { render_problem_page } from './problem_page.js';
 import {
 	STEPS,
@@ -30,7 +31,7 @@ export const USE_LOCALHOST_PATH = '/__syntax_auth_local/use-localhost';
 /**
  * @typedef {import('./names.js').SiteName} SiteName
  * @typedef {{ name?: SiteName, port?: number, routes?: { path: string, port: number }[] }} SyntaxAuthOptions
- * @typedef {import('./setup.js').SetupDeps & { ensure_syntax_auth: (options?: { can_start?: boolean }) => Promise<void> }} PluginDeps
+ * @typedef {import('./setup.js').SetupDeps & { ensure_syntax_auth: (options?: { can_start?: boolean, env?: NodeJS.ProcessEnv }) => Promise<void> }} PluginDeps
  * @typedef {import('./setup.js').SetupResult | { state: 'running', problems: [] }} SiteStatus
  * @typedef {import('node:http').IncomingMessage} Request
  * @typedef {import('node:http').ServerResponse} Response
@@ -189,30 +190,35 @@ export function create_plugin(options, deps) {
 		apply: 'serve',
 		/** @param {{ server?: { allowedHosts?: string[] | true } }} config */
 		config(config) {
-			if (!name || deps.env.VITEST || config.server?.allowedHosts === true) return undefined;
+			if (!name || is_set(deps.env, 'VITEST') || config.server?.allowedHosts === true) {
+				return undefined;
+			}
 			return { server: { allowedHosts: [SYNTAX_TEST_ALLOWED_HOST] } };
 		},
 		/** @param {DevServer} server */
 		configureServer(server) {
 			// Vitest also runs Vite in serve mode; tests must not start containers or change setup.
-			if (deps.env.VITEST) return;
-			// Without a name, exactly as before: keep local Syntax Auth running.
+			// VITEST counts when set at all, even to "" or "false".
+			if (is_set(deps.env, 'VITEST')) return;
+			// Without a name, as before: keep local Syntax Auth running. Like every caller, it opens the
+			// Docker app only with a person at the Mac's screen.
 			if (!name) {
 				deps
-					.ensure_syntax_auth()
+					.ensure_syntax_auth({ env: deps.env })
 					.catch((error) => console.error('Syntax Auth local startup failed', error));
 				return;
 			}
 			// Syntax Auth's own dev server takes the container's place (scripts/local_server.js).
-			// A site's dev server starts Docker and the container only in the Mac's desktop session (an
-			// agent shell's too: neither shows one of setup's dialogs); on Linux, Windows, over SSH, in
-			// CI, or under a test runner it only checks, like the rest of setup.
+			// A site's dev server starts the container only in the Mac's desktop session (an agent shell's
+			// too, when Docker already runs: that shows no dialog); on Linux, Windows, over SSH, in CI, or
+			// under a test runner it only checks, like the rest of setup. It opens the Docker app only
+			// with a person at the screen, never from an agent shell (see ensure_syntax_auth).
 			if (name !== 'auth') {
 				void (async () => {
 					try {
 						const can_start =
 							deps.platform === 'darwin' && (await has_desktop(with_command_timeouts(deps)));
-						await deps.ensure_syntax_auth({ can_start });
+						await deps.ensure_syntax_auth({ can_start, env: deps.env });
 					} catch (error) {
 						deps.warn(
 							`Local Syntax Auth wasn't checked: ${error instanceof Error ? error.message : String(error)}. Restart dev to try again.`

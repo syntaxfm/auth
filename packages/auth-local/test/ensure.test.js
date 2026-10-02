@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { run as real_run, stall_message, with_port_lock } from '../container.js';
+import { run as real_run, sleep, stall_message, with_port_lock } from '../container.js';
 import { ensure_syntax_auth } from '../index.js';
 import { free_port } from './stand_ins.js';
 
@@ -126,11 +126,13 @@ test(
 
 /**
  * Docker on a Mac where the engine isn't running: `open -a Docker` opens the app, which answers
- * `docker info` after `ready_ms` (never, when null). Syntax Auth's image is there and its container
- * starts on `docker run`.
+ * `docker info` after `ready_ms` (never, when null), or hangs until its limit when `open_stalls`.
+ * Syntax Auth's image is there and its container starts on `docker run`. `launchctl managername`
+ * gives `desktop`.
  * @param {number | null} ready_ms
+ * @param {{ open_stalls?: boolean, desktop?: string }} [scene]
  */
-function sleeping_docker(ready_ms) {
+function sleeping_docker(ready_ms, { open_stalls = false, desktop = 'Aqua' } = {}) {
 	/** @type {string[]} */
 	const calls = [];
 	/** @type {number | null} */
@@ -139,9 +141,20 @@ function sleeping_docker(ready_ms) {
 	const is_ready = () =>
 		opened_at !== null && ready_ms !== null && Date.now() - opened_at >= ready_ms;
 	/** @type {import('../container.js').Run} */
-	const run = async (command, args) => {
+	const run = async (command, args, options = {}) => {
 		calls.push(`${command} ${args.join(' ')}`);
+		if (command === 'launchctl') return ok(desktop);
 		if (command === 'open') {
+			if (open_stalls) {
+				// Hangs past its limit, so the other dev server waits on the lock meanwhile.
+				await sleep(20);
+				return {
+					code: null,
+					stdout: '',
+					stderr: stall_message(command, args, Number(options.timeout_ms)),
+					timed_out: true
+				};
+			}
 			opened_at ??= Date.now();
 			return ok();
 		}
@@ -164,9 +177,17 @@ function sleeping_docker(ready_ms) {
 	};
 }
 
-/** @param {ReturnType<typeof sleeping_docker>} docker @param {string} directory @param {number} lock_port */
-function start_on(docker, directory, lock_port) {
+/**
+ * A dev server's start of local Syntax Auth on `docker`'s Mac, by default with a person at its
+ * screen (no marker set).
+ * @param {ReturnType<typeof sleeping_docker>} docker
+ * @param {string} directory
+ * @param {number} lock_port
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+function start_on(docker, directory, lock_port, env = {}) {
 	return start(docker.run, {
+		env,
 		is_healthy: async () => docker.is_started(),
 		container_lock: (task) => with_port_lock(lock_port, task),
 		docker_start: {
@@ -224,4 +245,158 @@ test("a dev server that waited for another's Docker start gets that start's fail
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+test("a dev server that waited for another's start gets the same message when that start's `open` stalled, and never opens Docker again", async () => {
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		const docker = sleeping_docker(null, { open_stalls: true });
+		const lock_port = await free_port();
+		const message =
+			"Running signed out: `open --background -a Docker` didn't finish within 30 seconds, so local Syntax Auth's startup stopped it. macOS didn't finish opening the Docker app. Open Docker Desktop or OrbStack yourself, then restart dev.";
+		const both = await Promise.all([
+			start_on(docker, directory, lock_port),
+			start_on(docker, directory, lock_port)
+		]);
+		assert.deepEqual(both, [
+			{ warnings: [message], updaters: 0 },
+			{ warnings: [message], updaters: 0 }
+		]);
+		assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/** @param {string} where */
+const not_opened = (where) =>
+	`Running signed out: Docker isn't running, and this dev server was started ${where}, so it didn't open Docker Desktop or OrbStack. Start Docker Desktop (or OrbStack), then restart dev.`;
+
+const NOBODY_AT_THE_SCREEN = [
+	{ env: { PI_CODING_AGENT: 'true' }, where: 'from an agent shell (PI_CODING_AGENT)' },
+	{ env: { CLAUDECODE: '1' }, where: 'from an agent shell (CLAUDECODE)' },
+	{
+		env: { PI_CODING_AGENT: 'true', SYNTAX_DEV_SETUP_DIALOGS: 'yes' },
+		where: 'from an agent shell (PI_CODING_AGENT)'
+	},
+	{ env: { CI: 'true' }, where: 'in CI (CI is set)' },
+	{
+		env: { SSH_CONNECTION: '100.64.0.2 50000 100.64.0.1 22' },
+		where: 'over SSH (SSH_CONNECTION is set)'
+	},
+	{ env: { SSH_TTY: '/dev/ttys004' }, where: 'over SSH (SSH_TTY is set)' },
+	{
+		env: { NODE_TEST_CONTEXT: 'child-v8' },
+		where: 'under a test runner (NODE_TEST_CONTEXT is set)'
+	},
+	{ env: { VITEST: 'true' }, where: 'under a test runner (VITEST is set)' },
+	{
+		env: { SSH_TTY: '/dev/ttys004', SYNTAX_DEV_SETUP_DIALOGS: 'allow' },
+		where: 'over SSH (SSH_TTY is set)'
+	},
+	{
+		env: {},
+		desktop: 'Background',
+		where: "outside this Mac's desktop session (`launchctl managername` says Background, not Aqua)"
+	}
+];
+
+test('with nobody known to be at the screen, a start never opens Docker Desktop or OrbStack, and says why', async () => {
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		for (const scene of NOBODY_AT_THE_SCREEN) {
+			const docker = sleeping_docker(0, { desktop: scene.desktop });
+			const result = await start_on(docker, directory, await free_port(), scene.env);
+			assert.deepEqual(
+				result,
+				{ warnings: [not_opened(scene.where)], updaters: 0 },
+				JSON.stringify(scene.env)
+			);
+			assert.deepEqual(docker.opens(), [], JSON.stringify(scene.env));
+			assert.equal(docker.is_started(), false);
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("every marker counts when it is set at all, even to an empty string, '0', or 'false'", async () => {
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		for (const value of ['', '0', 'false']) {
+			for (const scene of NOBODY_AT_THE_SCREEN.filter((scene) => !scene.desktop)) {
+				const env = Object.fromEntries(
+					Object.entries(scene.env).map(([name, set]) => [
+						name,
+						name === 'SYNTAX_DEV_SETUP_DIALOGS' ? set : value
+					])
+				);
+				const docker = sleeping_docker(0);
+				const result = await start_on(docker, directory, await free_port(), env);
+				assert.deepEqual(
+					result,
+					{ warnings: [not_opened(scene.where)], updaters: 0 },
+					JSON.stringify(env)
+				);
+				assert.deepEqual(docker.opens(), [], JSON.stringify(env));
+			}
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("without an env, a start reads this process's, so under this test runner it never opens Docker", async () => {
+	assert.ok(process.env.NODE_TEST_CONTEXT !== undefined);
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		const docker = sleeping_docker(0);
+		const result = await start(docker.run, {
+			is_healthy: async () => docker.is_started(),
+			docker_start: { platform: 'darwin', result_path: join(directory, 'docker-start.json') }
+		});
+		assert.deepEqual(result, {
+			warnings: [not_opened('under a test runner (NODE_TEST_CONTEXT is set)')],
+			updaters: 0
+		});
+		assert.deepEqual(docker.opens(), []);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test('SYNTAX_DEV_SETUP_DIALOGS=allow lets an agent shell at the screen open Docker for a supervised run', async () => {
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		for (const agent of [{ CLAUDECODE: '1' }, { PI_CODING_AGENT: 'true' }]) {
+			const docker = sleeping_docker(0);
+			const result = await start_on(docker, directory, await free_port(), {
+				...agent,
+				SYNTAX_DEV_SETUP_DIALOGS: 'allow'
+			});
+			assert.deepEqual(result, { warnings: [], updaters: 1 });
+			assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test('from an agent shell, a start whose Docker already runs still starts the container', async () => {
+	const docker = stalling_docker('none');
+	assert.deepEqual(
+		await start(docker.run, {
+			env: { PI_CODING_AGENT: 'true' },
+			is_healthy: async () => docker.calls.includes('docker run'),
+			docker_start: { platform: 'darwin' }
+		}),
+		{ warnings: [], updaters: 1 }
+	);
+	assert.deepEqual(docker.calls, [
+		'docker info',
+		'docker image',
+		'docker pull',
+		'docker container',
+		'docker run'
+	]);
 });

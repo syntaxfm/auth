@@ -559,6 +559,29 @@ test('an agent shell, CI, SSH, a test runner, or no desktop session: no dialog, 
 	}
 });
 
+test("a marker set to an empty string, '0', or 'false' still counts: no dialog, nothing changes", async () => {
+	for (const value of ['', '0', 'false']) {
+		for (const scene of NO_DIALOG_SCENES.filter((scene) => !scene.desktop)) {
+			const env = Object.fromEntries(
+				Object.entries(scene.env).map(([name, set]) => [
+					name,
+					name === 'SYNTAX_DEV_SETUP_DIALOGS' ? set : value
+				])
+			);
+			const label = JSON.stringify(env);
+			const { mac, dev } = await mac_missing_trust();
+			mac.deps.env = env;
+			const result = await setup_lab(mac, dev);
+			assert.equal(result.state, 'failed', label);
+			const [first] = describe_result({ name: 'lab' }, result, 1337);
+			if (typeof scene.notice === 'string') assert.equal(first, scene.notice, label);
+			else assert.match(first, scene.notice, label);
+			assert.deepEqual(privileged_commands(mac), [], label);
+			assert.deepEqual(mac.caddy?.writes, [], label);
+		}
+	}
+});
+
 test('SYNTAX_DEV_SETUP_DIALOGS=allow lets an agent shell show the dialogs for a supervised run', async () => {
 	for (const agent of [{ CLAUDECODE: '1' }, { PI_CODING_AGENT: 'true' }]) {
 		const { mac, dev } = await mac_missing_trust();

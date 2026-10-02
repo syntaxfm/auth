@@ -111,10 +111,10 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    Every dev server start then makes sure the one shared `syntax-auth` container is running,
    whether or not any other Syntax app is already running, without delaying the dev server. Any number of
    apps may start at once: container changes are serialized by a machine-wide lock that the OS
-   releases even if a process crashes. It opens Docker Desktop (or OrbStack) on macOS when needed,
-   under the same lock, so the app is opened only once at a time: a second app starting meanwhile
-   waits for that start and, if it failed, prints the same message instead of opening it again. It
-   pulls newer
+   releases even if a process crashes. It opens Docker Desktop (or OrbStack) on macOS when needed
+   and a person is at the Mac's screen (see below for when it never does), under the same lock, so
+   the app is opened only once at a time: a second app starting meanwhile waits for that start and,
+   if it failed or stalled, prints the same message instead of opening it again. It pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
    volume, and skips Vitest. If Docker is missing or stopped, the image is not accessible, or
    another program holds the port, it prints one warning naming the exact problem and its fix, and
@@ -220,6 +220,9 @@ starts:
   (`NODE_TEST_CONTEXT` or `VITEST` set);
 - outside the Mac's desktop session (`launchctl managername` isn't `Aqua`).
 
+Each of these variables counts when it is set at all, whatever its value: `CI=`, `CI=0`, and
+`CI=false` all mean CI. Only an unset variable is absent.
+
 Its first line says which one, for example "Started from an agent shell (PI_CODING_AGENT), so
 setup didn't show any dialogs and changed nothing." Each fix after it is a command to run in
 Terminal at the Mac's own screen, such as
@@ -227,9 +230,16 @@ Terminal at the Mac's own screen, such as
 prints it with its own port and routes); `setup lab` and `setup website` need `--port`. When you
 are watching the screen and want an agent's run to show the dialogs, start it with
 `SYNTAX_DEV_SETUP_DIALOGS=allow`, for example `SYNTAX_DEV_SETUP_DIALOGS=allow pnpm dev`. That
-switch never works over SSH, in CI, or under a test runner. An agent's dev server still opens
-Docker and starts the local Syntax Auth container when needed, since neither shows one of
-setup's dialogs.
+switch never works over SSH, in CI, or under a test runner.
+
+In those same cases nothing opens Docker Desktop or OrbStack either, since their first run and
+privileged helper can show dialogs of their own: not a dev server with a name, not one without,
+and not `syntax-auth-local`. If Docker isn't running, the app runs signed out with a message
+such as "Docker isn't running, and this dev server was started from an agent shell
+(PI_CODING_AGENT), so it didn't open Docker Desktop or OrbStack. Start Docker Desktop (or
+OrbStack), then restart dev." When Docker already runs, an agent's dev server still starts the
+local Syntax Auth container, which shows no dialog. `SYNTAX_DEV_SETUP_DIALOGS=allow`, at the
+Mac's screen, lets it open Docker too.
 
 On Linux and Windows setup changes nothing and says that automatic setup is macOS-only for now.
 There, and over SSH, in CI, under a test runner, or outside the desktop session, a named dev

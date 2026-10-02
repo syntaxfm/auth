@@ -27,7 +27,7 @@ import {
 	with_startup_limits
 } from './container.js';
 import { create_plugin } from './plugin.js';
-import { default_setup_deps } from './setup.js';
+import { default_setup_deps, why_not_open } from './setup.js';
 
 const READY_TIMEOUT_MS = 180_000;
 const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
@@ -35,6 +35,7 @@ const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
 /**
  * @typedef {object} EnsureOptions
  * @property {boolean} [can_start] false: only check, never start Docker, the container, or the updater
+ * @property {NodeJS.ProcessEnv} [env] decides whether the Docker app may be opened (see why_not_open)
  * @property {import('./container.js').Run} [run]
  * @property {() => Promise<boolean>} [is_healthy]
  * @property {() => void} [start_updater]
@@ -130,11 +131,15 @@ async function start_and_wait(run_command, check, lock) {
  * Makes sure the shared local Syntax Auth is running. Never throws. With `can_start: false` (a
  * site's dev server on Linux, or where nobody is at the Mac's screen) it only checks, and says how
  * to start it. Every command it runs has a time limit (see STARTUP_LIMITS); one that stalls is
- * stopped, and the app runs signed out with a message naming it.
+ * stopped, and the app runs signed out with a message naming it. It opens Docker Desktop or OrbStack
+ * only with a person at the Mac's screen: never from an agent shell, over SSH, in CI, under a test
+ * runner, or outside the desktop session (unless SYNTAX_DEV_SETUP_DIALOGS=allow, at the screen), so
+ * no dialog of Docker's own appears there. Starting the container when Docker runs shows none.
  * @param {EnsureOptions} [options]
  */
 export async function ensure_syntax_auth({
 	can_start = true,
+	env = process.env,
 	run: unbounded_run = run,
 	is_healthy: check = is_healthy,
 	start_updater: updater = start_updater,
@@ -153,7 +158,11 @@ export async function ensure_syntax_auth({
 				return;
 			}
 			const problem =
-				(await ensure_docker(run_command, { ...docker_start, lock: container_lock })) ??
+				(await ensure_docker(run_command, {
+					...docker_start,
+					lock: container_lock,
+					why_not_open: () => why_not_open({ run: run_command, env })
+				})) ??
 				(await ensure_image(run_command)) ??
 				(await start_and_wait(run_command, check, container_lock));
 			if (problem) {

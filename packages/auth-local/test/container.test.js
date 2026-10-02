@@ -25,7 +25,16 @@ test('under a test runner, a command that could show a dialog or change this com
 		);
 	}
 
-	for (const env of [{ NODE_TEST_CONTEXT: 'child-v8' }, { VITEST: 'true' }]) {
+	// A marker counts when set at all, even to "", "0", or "false".
+	for (const env of [
+		{ NODE_TEST_CONTEXT: 'child-v8' },
+		{ VITEST: 'true' },
+		{ NODE_TEST_CONTEXT: '' },
+		{ VITEST: '' },
+		{ VITEST: 'false' }
+	]) {
+		assert.ok(refused_under_tests('open', ['--background', '-a', 'Docker'], env));
+		assert.ok(refused_under_tests('/usr/bin/osascript', ['-e', 'x'], env));
 		assert.ok(refused_under_tests('security', ['delete-certificate', '-Z', 'abc'], env));
 		assert.equal(refused_under_tests('security', ['verify-cert', '-c', 'leaf.pem'], env), null);
 		assert.equal(refused_under_tests('security', ['find-certificate', '-a'], env), null);

@@ -12,6 +12,7 @@ import {
 	SETUP_LOCK_PORT,
 	SYNTAX_AUTH_LOCAL_PORT,
 	ensure_docker,
+	is_set,
 	log,
 	run,
 	sleep,
@@ -39,7 +40,8 @@ export const STEPS = {
  * @typedef {{ name: SiteName, port?: number, routes?: { path: string, port: number }[], nonce?: string, probe_path?: string }} SetupOptions
  * @typedef {{ sites: Site[], caddy: Caddy, root_pem: string, can_change: boolean }} SetupContext
  * @typedef {{ state: 'worked', problems: [], context: SetupContext } | { state: 'failed', problems: StepProblem[], notice?: string } | { state: 'unsupported', problems: [] }} SetupResult
- * @typedef {{ has_desktop: boolean, can_ask: true, notice: null } | { has_desktop: boolean, can_ask: false, notice: string }} Presence
+ * @typedef {{ has_desktop: boolean, can_ask: true, notice: null, where: null } | { has_desktop: boolean, can_ask: false, notice: string, where: string }} Presence
+ *   `where` says where a run that can't ask started, like "from an agent shell (PI_CODING_AGENT)".
  * @typedef {object} SetupDeps
  * @property {import('./container.js').Run} run
  * @property {NodeJS.Platform} platform
@@ -81,7 +83,11 @@ export function default_setup_deps() {
 			(await lookup(hostname, { all: true })).map((entry) => entry.address),
 		setup_lock: (task) => with_port_lock(SETUP_LOCK_PORT, task),
 		container_lock: with_container_lock,
-		ensure_docker,
+		// Setup starts Docker only when it may ask; the check stays here so nothing else can skip it.
+		ensure_docker: (run_command) =>
+			ensure_docker(run_command, {
+				why_not_open: () => why_not_open({ run: run_command, env: process.env })
+			}),
 		log,
 		warn,
 		recheck_ms: 15_000,
@@ -138,13 +144,23 @@ export const DIALOGS_SWITCH = 'SYNTAX_DEV_SETUP_DIALOGS';
 /** The variables that mark a shell an AI coding agent started. */
 const AGENT_VARIABLES = ['CLAUDECODE', 'PI_CODING_AGENT'];
 
+/** Each variable that marks a run nobody at the screen can answer, and where that run started. */
+const AWAY_VARIABLES = [
+	['NODE_TEST_CONTEXT', 'under a test runner (NODE_TEST_CONTEXT is set)'],
+	['VITEST', 'under a test runner (VITEST is set)'],
+	['CI', 'in CI (CI is set)'],
+	['SSH_CONNECTION', 'over SSH (SSH_CONNECTION is set)'],
+	['SSH_TTY', 'over SSH (SSH_TTY is set)']
+];
+
 /**
  * Whether this run is at the Mac's own desktop session (`has_desktop`), and whether setup may show
  * a password or approval dialog there (`can_ask`). Under a test runner, over SSH, in CI, or outside
  * the desktop session, nobody can answer one. From an agent shell nobody is known to be watching,
  * so setup shows none unless `SYNTAX_DEV_SETUP_DIALOGS=allow` says a person is; the switch never
  * works under a test runner, over SSH, or in CI. When setup can't ask, `notice` says why, as the
- * first line it prints.
+ * first line it prints. Every marker counts when it is set at all, whatever its value (even "",
+ * "0", or "false"); only SYNTAX_DEV_SETUP_DIALOGS needs exactly `allow`.
  * @param {{ run: import('./container.js').Run, env: NodeJS.ProcessEnv }} deps
  * @returns {Promise<Presence>}
  */
@@ -157,13 +173,11 @@ export async function check_presence({ run, env }) {
 	const away = (where) => ({
 		has_desktop: false,
 		can_ask: false,
-		notice: `Started ${where}, so setup didn't show any dialogs and changed nothing.${refused}`
+		notice: `Started ${where}, so setup didn't show any dialogs and changed nothing.${refused}`,
+		where
 	});
-	if (env.NODE_TEST_CONTEXT) return away('under a test runner (NODE_TEST_CONTEXT is set)');
-	if (env.VITEST) return away('under a test runner (VITEST is set)');
-	if (env.CI) return away('in CI (CI is set)');
-	if (env.SSH_CONNECTION) return away('over SSH (SSH_CONNECTION is set)');
-	if (env.SSH_TTY) return away('over SSH (SSH_TTY is set)');
+	const marked = AWAY_VARIABLES.find(([variable]) => is_set(env, variable));
+	if (marked) return away(marked[1]);
 	const manager = await run('launchctl', ['managername']);
 	const session = manager.code === 0 ? manager.stdout.trim() : '';
 	if (session !== 'Aqua') {
@@ -171,15 +185,27 @@ export async function check_presence({ run, env }) {
 			`outside this Mac's desktop session (\`launchctl managername\` says ${session || 'nothing'}, not Aqua)`
 		);
 	}
-	const agent = AGENT_VARIABLES.find((variable) => env[variable]);
+	const agent = AGENT_VARIABLES.find((variable) => is_set(env, variable));
 	if (agent && !is_allowed) {
 		return {
 			has_desktop: true,
 			can_ask: false,
-			notice: `Started from an agent shell (${agent}), so setup didn't show any dialogs and changed nothing. A person at this Mac can run each fix below in their own Terminal, or restart dev with ${DIALOGS_SWITCH}=allow while watching the screen.`
+			notice: `Started from an agent shell (${agent}), so setup didn't show any dialogs and changed nothing. A person at this Mac can run each fix below in their own Terminal, or restart dev with ${DIALOGS_SWITCH}=allow while watching the screen.`,
+			where: `from an agent shell (${agent})`
 		};
 	}
-	return { has_desktop: true, can_ask: true, notice: null };
+	return { has_desktop: true, can_ask: true, notice: null, where: null };
+}
+
+/**
+ * Null when the Docker app may be opened: only where setup may show its dialogs, since Docker
+ * Desktop's first run and its privileged helper can show their own. Otherwise where this run
+ * started, like "from an agent shell (PI_CODING_AGENT)".
+ * @param {{ run: import('./container.js').Run, env: NodeJS.ProcessEnv }} deps
+ * @returns {Promise<string | null>}
+ */
+export async function why_not_open(deps) {
+	return (await check_presence(deps)).where;
 }
 
 /**

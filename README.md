@@ -132,7 +132,14 @@ says why on its first line, and prints each fix, such as running
 `node packages/auth-local/bin.js setup auth` in Terminal at the Mac's own screen. To let an
 agent's run show the dialogs while you watch the screen, start it with
 `SYNTAX_DEV_SETUP_DIALOGS=allow` (for example `SYNTAX_DEV_SETUP_DIALOGS=allow pnpm dev`); the
-switch never works over SSH, in CI, or under a test runner.
+switch never works over SSH, in CI, or under a test runner. Each of those variables counts when
+set at all, even to an empty string, `0`, or `false`.
+
+In the same cases no dev server (with a name or without) and no `syntax-auth-local` opens
+Docker Desktop or OrbStack, whose first run and privileged helper can show dialogs; if Docker
+isn't running, the app runs signed out and says to start Docker, then restart dev. When Docker
+already runs, the local Syntax Auth container still starts. `SYNTAX_DEV_SETUP_DIALOGS=allow` at
+the Mac's screen lets it open Docker too.
 
 Setup leaves everything in place when dev stops. To undo it:
 

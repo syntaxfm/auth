@@ -17,6 +17,8 @@ export const TLS_POLICY_ID = 'syntax-test-tls';
 export const SOURCE_PATH = '/syntax-caddy-source';
 const API_TIMEOUT_MS = 10_000;
 const API_START_TIMEOUT_MS = 30_000;
+const PULL_TIMEOUT_MS = 600_000;
+const CONTAINER_START_TIMEOUT_MS = 120_000;
 const PORT_IN_USE = /address already in use|port is already allocated|ports are not available/i;
 
 /**
@@ -129,7 +131,22 @@ async function inspect_own_container(deps) {
 }
 
 /**
- * Proves that what answers on port 2019 is Syntax's own Caddy container or a `caddy` process.
+ * The listeners that receive a connection to `host`:`port`: one bound to that exact address wins
+ * over a wildcard one (`*`, IPv4 or dual-stack), as the kernel decides.
+ * @param {import('./container.js').Listener[]} listeners
+ * @param {string} host an IPv4 address, like 127.0.0.1
+ */
+export function answering_listeners(listeners, host) {
+	const ipv4 = listeners.filter(
+		(listener) => listener.proto === 'tcp4' || listener.proto === 'tcp46'
+	);
+	const exact = ipv4.filter((listener) => listener.address === host);
+	return exact.length > 0 ? exact : ipv4.filter((listener) => listener.address === '*');
+}
+
+/**
+ * Proves that what answers on the admin API's address is Syntax's own Caddy container, or a
+ * `caddy` process that owns the very listener the API answered on.
  * @param {CaddyDeps} deps
  * @returns {Promise<{ kind: 'native' | 'container' } | Problem>}
  */
@@ -139,16 +156,36 @@ async function prove_caddy(deps) {
 		return { kind: 'container' };
 	}
 
-	const listeners = await find_port_listeners(deps.admin_port, deps.run);
-	for (const listener of listeners) {
-		const command = await deps.run('ps', ['-o', 'comm=', '-p', String(listener.pid)]);
-		if (command.code === 0 && basename(command.stdout.trim()) === 'caddy')
-			return { kind: 'native' };
+	const host = new URL(deps.admin_origin).hostname;
+	const address = `${host}:${deps.admin_port}`;
+	const found = await find_port_listeners(deps.admin_port, deps.run);
+	if ('error' in found) {
+		return {
+			problem: `Setup couldn't check which program answers Caddy's admin API on ${address}: ${found.error}.`,
+			fix: `Run \`netstat -anv -p tcp\` in Terminal to see why it fails, then restart dev.`
+		};
 	}
-	const holder = describe_listeners(listeners) || 'a program setup couldn’t identify';
+	const answering = answering_listeners(found.listeners, host);
+	const holders = describe_listeners(answering);
+	if (answering.length === 0) {
+		const others = describe_listeners(found.listeners);
+		return {
+			problem: `Port ${deps.admin_port} answers like Caddy's admin API on ${address}, but netstat shows no program listening on ${address}${others ? ` (only ${others}, on other addresses)` : ''}, so setup can't tell which program answered and won't change it.`,
+			fix: `Restart dev to try again. If this repeats, check \`netstat -anv -p tcp | grep '\\.${deps.admin_port} '\` for the program on ${address}.`
+		};
+	}
+	if (new Set(answering.map((listener) => listener.pid)).size > 1) {
+		return {
+			problem: `More than one program listens on ${address} (${holders}), so setup can't tell which one answers like Caddy's admin API, and won't change it.`,
+			fix: `Stop the one that isn't your Caddy, then restart dev.`
+		};
+	}
+	const [listener] = answering;
+	const command = await deps.run('ps', ['-o', 'comm=', '-p', String(listener.pid)]);
+	if (command.code === 0 && basename(command.stdout.trim()) === 'caddy') return { kind: 'native' };
 	return {
-		problem: `Port ${deps.admin_port} answers like Caddy's admin API, but it's held by ${holder}, which is neither a caddy process nor Syntax's ${CADDY_CONTAINER} container, so setup won't change it.`,
-		fix: `Stop ${holder} so setup can start its own Caddy, or run your Caddy as a caddy process, then restart dev.`
+		problem: `Port ${deps.admin_port} answers like Caddy's admin API, but ${address} is held by ${holders}, which is neither a caddy process nor Syntax's ${CADDY_CONTAINER} container, so setup won't change it.`,
+		fix: `Stop ${holders} so setup can start its own Caddy, or run your Caddy as a caddy process, then restart dev.`
 	};
 }
 
@@ -216,7 +253,9 @@ async function start_own_caddy(deps) {
 	if (docker_problem) return { problem: docker_problem, fix: '' };
 
 	if ((await deps.run('docker', ['image', 'inspect', CADDY_IMAGE])).code !== 0) {
-		const pull = await deps.run('docker', ['pull', '--quiet', CADDY_IMAGE]);
+		const pull = await deps.run('docker', ['pull', '--quiet', CADDY_IMAGE], {
+			timeout_ms: PULL_TIMEOUT_MS
+		});
 		if (pull.code !== 0) {
 			return {
 				problem: `Caddy's Docker image couldn't be downloaded: ${first_line(pull.stderr)}`,
@@ -232,54 +271,67 @@ async function start_own_caddy(deps) {
 		const own = await inspect_own_container(deps);
 		if (!own?.running) {
 			for (const port of [deps.https_port, deps.http_port, deps.admin_port]) {
-				const listeners = await find_port_listeners(port, deps.run);
-				if (listeners.length > 0) return port_in_use(deps, port, describe_listeners(listeners));
+				const found = await find_port_listeners(port, deps.run);
+				if ('error' in found) {
+					return {
+						problem: `Setup couldn't check whether port ${port} is free for Syntax's Caddy container: ${found.error}.`,
+						fix: `Run \`netstat -anv -p tcp\` in Terminal to see why it fails, then restart dev.`
+					};
+				}
+				if (found.listeners.length > 0) {
+					return port_in_use(deps, port, describe_listeners(found.listeners));
+				}
 			}
 		}
 
 		let result;
 		if (own && own.image === CADDY_IMAGE && own.admin_bound_to_loopback) {
-			result = own.running ? null : await deps.run('docker', ['start', CADDY_CONTAINER]);
+			result = own.running
+				? null
+				: await deps.run('docker', ['start', CADDY_CONTAINER], {
+						timeout_ms: CONTAINER_START_TIMEOUT_MS
+					});
 		} else {
 			if (own) await deps.run('docker', ['rm', '--force', CADDY_CONTAINER]);
-			result = await deps.run('docker', [
-				'run',
-				'--detach',
-				'--name',
-				CADDY_CONTAINER,
-				'--restart',
-				'unless-stopped',
-				'--publish',
-				`127.0.0.1:${deps.https_port}:443`,
-				'--publish',
-				`127.0.0.1:${deps.http_port}:80`,
-				'--publish',
-				`127.0.0.1:${deps.admin_port}:2019`,
-				'--volume',
-				'syntax-caddy-data:/data',
-				'--volume',
-				'syntax-caddy-config:/config',
-				'--env',
-				`SYNTAX_CADDY_BASE=${JSON.stringify(base_config(deps))}`,
-				'--entrypoint',
-				'/bin/sh',
-				CADDY_IMAGE,
-				'-c',
-				// --resume loads the config saved by the last API change, so routes survive restarts.
-				'printf "%s" "$SYNTAX_CADDY_BASE" > /etc/caddy/syntax-base.json && exec caddy run --resume --config /etc/caddy/syntax-base.json'
-			]);
+			result = await deps.run(
+				'docker',
+				[
+					'run',
+					'--detach',
+					'--name',
+					CADDY_CONTAINER,
+					'--restart',
+					'unless-stopped',
+					'--publish',
+					`127.0.0.1:${deps.https_port}:443`,
+					'--publish',
+					`127.0.0.1:${deps.http_port}:80`,
+					'--publish',
+					`127.0.0.1:${deps.admin_port}:2019`,
+					'--volume',
+					'syntax-caddy-data:/data',
+					'--volume',
+					'syntax-caddy-config:/config',
+					'--env',
+					`SYNTAX_CADDY_BASE=${JSON.stringify(base_config(deps))}`,
+					'--entrypoint',
+					'/bin/sh',
+					CADDY_IMAGE,
+					'-c',
+					// --resume loads the config saved by the last API change, so routes survive restarts.
+					'printf "%s" "$SYNTAX_CADDY_BASE" > /etc/caddy/syntax-base.json && exec caddy run --resume --config /etc/caddy/syntax-base.json'
+				],
+				{ timeout_ms: CONTAINER_START_TIMEOUT_MS }
+			);
 		}
 		if (result && result.code !== 0) {
 			if (PORT_IN_USE.test(result.stderr)) {
 				const port = Number(
 					result.stderr.match(/(?:127\.0\.0\.1:|exposing port TCP [\d.]+:)(\d+)/)?.[1]
 				);
-				const listeners = port ? await find_port_listeners(port, deps.run) : [];
-				return port_in_use(
-					deps,
-					port || deps.https_port,
-					describe_listeners(listeners) || 'another program or container'
-				);
+				const found = port ? await find_port_listeners(port, deps.run) : { listeners: [] };
+				const holder = 'listeners' in found ? describe_listeners(found.listeners) : '';
+				return port_in_use(deps, port || deps.https_port, holder || 'another program or container');
 			}
 			return {
 				problem: `Syntax's Caddy container couldn't start: ${first_line(result.stderr)}`,
@@ -308,8 +360,9 @@ async function start_own_caddy(deps) {
 export async function find_caddy(deps, { can_change }) {
 	const status = await probe_caddy_api(deps);
 	if (status === 'other') {
+		const found = await find_port_listeners(deps.admin_port, deps.run);
 		const holder =
-			describe_listeners(await find_port_listeners(deps.admin_port, deps.run)) ||
+			('listeners' in found && describe_listeners(found.listeners)) ||
 			'a program setup couldn’t identify';
 		return {
 			problem: `Port ${deps.admin_port} is in use by ${holder}, which doesn't answer like Caddy's admin API, so setup can't add routes there or start its own Caddy.`,
@@ -412,22 +465,77 @@ function listen_ports(value) {
 	return value.map((address) => String(address).split(':').pop() ?? '');
 }
 
-/** @param {unknown} route @param {string} hostname */
-function route_matches_host(route, hostname) {
-	if (!is_object(route) || !Array.isArray(route.match)) return false;
-	return route.match.some(
-		(matcher) =>
-			is_object(matcher) &&
-			Array.isArray(matcher.host) &&
-			matcher.host.some(
-				(host) =>
-					host === hostname ||
-					(typeof host === 'string' &&
-						host.startsWith('*.') &&
-						hostname.endsWith(host.slice(1)) &&
-						!hostname.slice(0, -host.length + 1).includes('.'))
-			)
+/**
+ * Whether a host matcher pattern covers `hostname`, as Caddy's does: case-insensitive, and `*`
+ * stands for exactly one label (so `*.syntax.test` covers lab.syntax.test, not syntax.test).
+ * @param {string} pattern
+ * @param {string} hostname
+ */
+export function host_pattern_matches(pattern, hostname) {
+	const pattern_labels = pattern.toLowerCase().split('.');
+	const labels = hostname.toLowerCase().split('.');
+	return (
+		pattern_labels.length === labels.length &&
+		pattern_labels.every((label, i) => label === '*' || label === labels[i])
 	);
+}
+
+/**
+ * Whether a matcher set claims `hostname` anywhere inside it: a `host` list (in any nested matcher
+ * but `not`), or an expression that mentions it.
+ * @param {unknown} value
+ * @param {string} hostname
+ * @returns {boolean}
+ */
+function matcher_names_host(value, hostname) {
+	if (Array.isArray(value)) return value.some((item) => matcher_names_host(item, hostname));
+	if (!is_object(value)) return false;
+	const escaped = hostname.replaceAll('.', '\\.');
+	const mentions = new RegExp(`(^|[^a-z0-9.*-])${escaped}($|[^a-z0-9.-])`, 'i');
+	return Object.entries(value).some(([key, item]) => {
+		// `not` matches every other host, so a name inside it isn't a claim on that name.
+		if (key === 'not') return false;
+		if (key === 'host' && Array.isArray(item)) {
+			return item.some(
+				(pattern) => typeof pattern === 'string' && host_pattern_matches(pattern, hostname)
+			);
+		}
+		if (key === 'expression') {
+			// A CEL expression, as a string or as { expr }.
+			const text = is_object(item) ? item.expr : item;
+			return typeof text === 'string' && mentions.test(text);
+		}
+		return matcher_names_host(item, hostname);
+	});
+}
+
+/**
+ * Every route, at any depth (inside `subroute` handlers and any other nested `routes`), whose
+ * matchers name `hostname`, except the routes setup owns.
+ * @param {unknown} value
+ * @param {string} path where `value` sits, like "routes/1/handle/0"
+ * @param {string} hostname
+ * @param {Set<string>} own_ids
+ * @returns {{ path: string, id?: string }[]}
+ */
+export function find_host_routes(value, path, hostname, own_ids) {
+	if (Array.isArray(value)) {
+		return value.flatMap((item, i) => find_host_routes(item, `${path}/${i}`, hostname, own_ids));
+	}
+	if (!is_object(value)) return [];
+	if (typeof value['@id'] === 'string' && own_ids.has(value['@id'])) return [];
+	/** @type {{ path: string, id?: string }[]} */
+	const found = [];
+	if (Array.isArray(value.match) && matcher_names_host(value.match, hostname)) {
+		found.push({
+			path,
+			...(typeof value['@id'] === 'string' && { id: value['@id'] })
+		});
+	}
+	for (const [key, item] of Object.entries(value)) {
+		if (key !== 'match') found.push(...find_host_routes(item, `${path}/${key}`, hostname, own_ids));
+	}
+	return found;
 }
 
 /**
@@ -515,19 +623,27 @@ export async function ensure_caddy_config(
 		});
 	}
 
+	// Every site's name is checked before anything is written.
+	const own_ids = new Set(sites.map((site) => route_id(site.name)));
+	for (const site of sites) {
+		const hostname = SITE_HOSTNAMES[site.name];
+		const [foreign] = [
+			...find_host_routes(server.routes, 'routes', hostname, own_ids),
+			...find_host_routes(server.errors, 'errors', hostname, own_ids)
+		];
+		if (foreign) {
+			const named = foreign.id ? `the route "@id": "${foreign.id}" at ` : '';
+			return {
+				problem: `Caddy already has a route for ${hostname} that setup didn't add (${named}${foreign.path} of server ${server_name}), so setup won't take it over.`,
+				fix: `Remove that route (or its site block) from your Caddy config, reload Caddy, then restart dev.`
+			};
+		}
+	}
+
 	let has_routes = Array.isArray(server.routes);
 	for (const site of sites) {
 		const hostname = SITE_HOSTNAMES[site.name];
 		const id = route_id(site.name);
-		const foreign = routes.findIndex(
-			(route) => is_object(route) && route['@id'] !== id && route_matches_host(route, hostname)
-		);
-		if (foreign !== -1) {
-			return {
-				problem: `Caddy already has a route for ${hostname} that setup didn't add (routes/${foreign} of server ${server_name}), so setup won't take it over.`,
-				fix: `Remove that route (or its site block) from your Caddy config, reload Caddy, then restart dev.`
-			};
-		}
 
 		const route = site_route(caddy, site);
 		const existing = routes.find((item) => is_object(item) && item['@id'] === id);

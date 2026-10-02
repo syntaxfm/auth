@@ -4,7 +4,14 @@ import assert from 'node:assert/strict';
 import { createServer, request } from 'node:http';
 import { after, test } from 'node:test';
 
-import { PROBE_PATH, USE_LOCALHOST_PATH, create_middleware, create_plugin } from '../plugin.js';
+import { ensure_syntax_auth } from '../index.js';
+import {
+	PROBE_PATH,
+	USE_LOCALHOST_PATH,
+	create_middleware,
+	create_plugin,
+	safe_destination
+} from '../plugin.js';
 import { create_mac } from './stand_ins.js';
 
 /** @type {(() => Promise<unknown>)[]} */
@@ -156,13 +163,74 @@ test('after a failed setup, page loads get the problem page, which can keep this
 	assert.equal((await send(port, '/compositions/7', { host, cookie, ...NAVIGATE })).body, 'app');
 
 	// The link only ever leads to a path on this server.
-	for (const to of ['//evil.example/', 'https://evil.example/', '/\\evil.example']) {
+	for (const to of [
+		'//evil.example/',
+		'https://evil.example/',
+		'/\\evil.example',
+		'/\t/evil.example/'
+	]) {
 		const answer = await send(port, `${USE_LOCALHOST_PATH}?to=${encodeURIComponent(to)}`, {
 			host,
 			...NAVIGATE
 		});
 		assert.equal(answer.headers.location, '/', to);
 	}
+});
+
+test('the "use localhost" link never leaves this origin, whatever a browser would strip or rewrite', async () => {
+	const host = 'localhost:5173';
+	const bypasses = [
+		'/\t/evil.example/',
+		'/\n/evil.example/',
+		'/\r\n/evil.example/',
+		'\t//evil.example/',
+		'/\u0000/evil.example/',
+		'/\x7f/evil.example/',
+		'/\\evil.example/',
+		'\\/evil.example/',
+		'/\\/evil.example/',
+		'\\\\evil.example/',
+		'//evil.example/',
+		'///evil.example/',
+		' //evil.example/',
+		'/ /evil.example/',
+		'https://evil.example/',
+		'https:evil.example',
+		'javascript:alert(1)',
+		'%2F%2Fevil.example/',
+		'%2F%5Cevil.example/',
+		'',
+		null
+	];
+	for (const to of bypasses) {
+		assert.equal(safe_destination(to, host), '/', JSON.stringify(to));
+	}
+	// Through the dev server, encoded once (as the link does) and twice.
+	const port = await serve_with_status(FAILED);
+	for (const to of bypasses.filter((item) => item !== null)) {
+		for (const query of [encodeURIComponent(to), encodeURIComponent(encodeURIComponent(to))]) {
+			const answer = await send(port, `${USE_LOCALHOST_PATH}?to=${query}`, {
+				host: `localhost:${port}`,
+				...NAVIGATE
+			});
+			const location = String(answer.headers.location);
+			assert.equal(
+				new URL(location, `http://localhost:${port}`).origin,
+				`http://localhost:${port}`,
+				`${JSON.stringify(to)} -> ${location}`
+			);
+			assert.ok(location.startsWith('/') && !/^\/[/\\]/.test(location), location);
+		}
+	}
+
+	// Paths on this server keep their query and fragment, normalized as a browser would.
+	assert.equal(
+		safe_destination('/compositions/7?tab=layers#top', host),
+		'/compositions/7?tab=layers#top'
+	);
+	assert.equal(safe_destination('/a/../b', host), '/b');
+	assert.equal(safe_destination('/%2F/evil.example/', host), '/%2F/evil.example/');
+	assert.equal(safe_destination('/%09/evil.example/', host), '/%09/evil.example/');
 });
 
 test('while setup runs, page loads are served as usual; the probe answers only on the https name', async () => {
@@ -222,7 +290,7 @@ test('a wrong option fails at config load with what is wrong', () => {
 	);
 	assert.throws(
 		() => create_plugin({ name: 'lab', routes: [{ path: 'parties', port: 1999 }] }, fake_deps()),
-		/each route needs a path starting with "\/" and a port number/
+		/each route needs a path starting with "\/" \(without spaces, quotes, or backslashes\) and a port number/
 	);
 	assert.throws(
 		() => create_plugin({ name: 'lab', port: 0 }, fake_deps()),
@@ -231,12 +299,38 @@ test('a wrong option fails at config load with what is wrong', () => {
 });
 
 /**
+ * The real ensure_syntax_auth on the stand-in Mac: its commands run through `mac.run`, so a start
+ * of Docker or the container shows in `mac.calls`. Only the health check and the updater are
+ * stand-ins.
+ * @param {Awaited<ReturnType<typeof create_mac>>} mac
+ * @param {boolean} healthy whether local Syntax Auth answers
+ */
+function real_ensure(mac, healthy) {
+	const auth = { checks: 0, updaters: 0, /** @type {string[]} */ logs: [] };
+	/** @param {{ can_start?: boolean }} [options] */
+	const ensure = (options) =>
+		ensure_syntax_auth({
+			...options,
+			run: mac.run,
+			is_healthy: async () => {
+				auth.checks++;
+				return healthy;
+			},
+			start_updater: () => void auth.updaters++,
+			warn: (message) => void auth.logs.push(message)
+		});
+	return { auth, ensure };
+}
+
+/**
  * Starts a dev server with the plugin on the stand-in Mac and waits for setup's verdict.
  * @param {Awaited<ReturnType<typeof create_mac>>} mac
  * @param {import('../plugin.js').SyntaxAuthOptions} options
+ * @param {{ healthy?: boolean }} [scene]
  */
-async function start_with_plugin(mac, options) {
-	const deps = fake_deps({ ...mac.deps });
+async function start_with_plugin(mac, options, { healthy = true } = {}) {
+	const { auth, ensure } = real_ensure(mac, healthy);
+	const deps = fake_deps({ ...mac.deps, ensure_syntax_auth: ensure });
 	const plugin = create_plugin(options, deps);
 	const dev = await start_dev_server(false);
 	plugin.configureServer({ middlewares: { use: dev.use }, httpServer: dev.server });
@@ -247,15 +341,20 @@ async function start_with_plugin(mac, options) {
 		assert.ok(Date.now() < deadline, 'setup never reported');
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
-	return { port, deps };
+	while (options.name !== 'auth' && auth.checks === 0) {
+		assert.ok(Date.now() < deadline, 'local Syntax Auth was never checked');
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	return { port, deps, auth };
 }
 
 test('a dev server start: redirects after a working setup, and the problem page after a failed one', async () => {
 	const mac = await create_mac();
 	cleanups.push(() => mac.close());
-	const { port, deps } = await start_with_plugin(mac, { name: 'lab' });
+	const { port, auth } = await start_with_plugin(mac, { name: 'lab' });
 	assert.deepEqual(mac.logs, ['https://lab.syntax.test is ready.']);
-	assert.equal(deps.ensured, 1);
+	assert.deepEqual(auth, { checks: 1, updaters: 1, logs: [] });
 	const page = await send(port, '/a', { host: `localhost:${port}`, ...NAVIGATE });
 	assert.equal(page.headers.location, 'https://lab.syntax.test/a');
 
@@ -277,19 +376,69 @@ test('a dev server start: redirects after a working setup, and the problem page 
 test("Syntax Auth's own dev server sets up its name but never starts the container", async () => {
 	const mac = await create_mac();
 	cleanups.push(() => mac.close());
-	const { deps } = await start_with_plugin(mac, { name: 'auth' });
+	const { auth } = await start_with_plugin(mac, { name: 'auth' });
 	assert.deepEqual(mac.logs, ['https://auth.syntax.test is ready.']);
-	assert.equal(deps.ensured, 0);
+	assert.deepEqual(auth, { checks: 0, updaters: 0, logs: [] });
 });
 
 test('on Linux the plugin changes nothing, prints the macOS-only message, and serves pages as usual', async () => {
 	const mac = await create_mac();
 	cleanups.push(() => mac.close());
 	mac.deps.platform = 'linux';
-	const { port } = await start_with_plugin(mac, { name: 'lab' });
+	const { port, auth } = await start_with_plugin(mac, { name: 'lab' }, { healthy: false });
 	assert.deepEqual(mac.logs, [
 		`Automatic setup of https://lab.syntax.test is macOS-only for now; keep using http://localhost:${port}.`
 	]);
+	// Local Syntax Auth too is only checked: no Docker, no container, and the command to start it.
 	assert.deepEqual(mac.calls, []);
+	assert.deepEqual(auth, { checks: 1, updaters: 0, logs: [SIGNED_OUT] });
 	assert.equal((await send(port, '/', { host: `localhost:${port}`, ...NAVIGATE })).body, 'app');
+});
+
+const SIGNED_OUT =
+	"Running signed out: local Syntax Auth isn't running, and this dev server starts it only on a Mac with a person at its screen. Run `pnpm exec syntax-auth-local` to start it, then restart dev.";
+
+test('over SSH, or with nobody at the screen, a site never starts Docker or the container', async () => {
+	for (const scene of [
+		{ desktop: 'Aqua', env: { SSH_CONNECTION: '100.64.0.2 50000 100.64.0.1 22' } },
+		{ desktop: 'Background', env: {} }
+	]) {
+		const mac = await create_mac();
+		cleanups.push(() => mac.close());
+		mac.state.desktop = scene.desktop;
+		mac.deps.env = scene.env;
+		const { auth } = await start_with_plugin(mac, { name: 'lab' }, { healthy: false });
+		assert.deepEqual(auth, { checks: 1, updaters: 0, logs: [SIGNED_OUT] });
+		assert.deepEqual(
+			// Setup itself only reads (`docker container inspect`); nothing starts or downloads.
+			mac.commands().filter((command) => /^docker (info|image|pull|run|start)|^open/.test(command)),
+			[]
+		);
+	}
+});
+
+test("without a name the plugin keeps today's behavior on any platform: it starts local Syntax Auth", async () => {
+	const mac = await create_mac();
+	cleanups.push(() => mac.close());
+	mac.deps.platform = 'linux';
+	const { auth, ensure } = real_ensure(mac, true);
+	/** @type {unknown[]} */
+	const received = [];
+	const plugin = create_plugin(
+		{},
+		fake_deps({
+			...mac.deps,
+			ensure_syntax_auth: (options) => {
+				received.push(options);
+				return ensure(options);
+			}
+		})
+	);
+	let used = 0;
+	plugin.configureServer({ middlewares: { use: () => used++ }, httpServer: null });
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.deepEqual(received, [undefined]);
+	assert.deepEqual(auth, { checks: 1, updaters: 1, logs: [] });
+	assert.equal(used, 0);
+	assert.deepEqual(mac.calls, []);
 });

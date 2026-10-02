@@ -59,3 +59,22 @@ export function get_hostname(host_header) {
 		return host_header.toLowerCase();
 	}
 }
+
+/**
+ * Whether text has a space or a control character (C0, DEL, or C1), which browsers strip from URLs
+ * and shells split on.
+ * @param {string} text
+ */
+export function has_space_or_control(text) {
+	return [...text].some((char) => {
+		const code = char.codePointAt(0) ?? 0;
+		return code <= 0x20 || (code >= 0x7f && code <= 0x9f);
+	});
+}
+
+// A route path the setup command can print inside single quotes: no quotes, backslashes, spaces, or
+// control characters.
+/** @param {unknown} path @returns {path is string} */
+export function is_route_path(path) {
+	return typeof path === 'string' && /^\/[^\s'"\\]*$/.test(path) && !has_space_or_control(path);
+}

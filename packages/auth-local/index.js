@@ -18,6 +18,7 @@ import {
 	is_healthy,
 	log,
 	pull_image,
+	run,
 	sleep,
 	warn,
 	with_container_lock
@@ -28,35 +29,54 @@ import { default_setup_deps } from './setup.js';
 const READY_TIMEOUT_MS = 180_000;
 const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
 
+/**
+ * @typedef {object} EnsureOptions
+ * @property {boolean} [can_start] false: only check, never start Docker, the container, or the updater
+ * @property {import('./container.js').Run} [run]
+ * @property {() => Promise<boolean>} [is_healthy]
+ * @property {() => void} [start_updater]
+ * @property {(message: string) => void} [warn]
+ */
+
 // Downloads the image outside the lock, so a slow first download never makes other apps time out
 // waiting. Concurrent pulls of the same image are safe.
-/** @returns {Promise<string | null>} null when the image is available, otherwise what is wrong. */
-async function ensure_image() {
-	if ((await docker(['image', 'inspect', IMAGE])).code === 0) return null;
+/**
+ * @param {import('./container.js').Run} run_command
+ * @returns {Promise<string | null>} null when the image is available, otherwise what is wrong.
+ */
+async function ensure_image(run_command) {
+	if ((await docker(['image', 'inspect', IMAGE], run_command)).code === 0) return null;
 
 	log('Downloading local Syntax Auth (first run only)');
-	return pull_image();
+	return pull_image(run_command);
 }
 
-/** @returns {Promise<string | null>} null when Syntax Auth is running or starting. */
-async function start_container() {
+/**
+ * @param {import('./container.js').Run} run_command
+ * @param {() => Promise<boolean>} check
+ * @returns {Promise<string | null>} null when Syntax Auth is running or starting.
+ */
+async function start_container(run_command, check) {
 	// Another dev server may have started it while this one waited for the lock.
-	if (await is_healthy()) return null;
+	if (await check()) return null;
 
-	const state = await get_container_state();
-	if (!state) return create_container();
+	const state = await get_container_state(run_command);
+	if (!state) return create_container(run_command);
 	if (state.is_running) return null;
 
-	const result = await docker(['start', CONTAINER_NAME]);
+	const result = await docker(['start', CONTAINER_NAME], run_command);
 	return result.code === 0 ? null : result.stderr;
 }
 
-/** @param {string} error Docker's error from creating or starting the container. */
-async function describe_start_error(error) {
+/**
+ * @param {string} error Docker's error from creating or starting the container.
+ * @param {import('./container.js').Run} run_command
+ */
+async function describe_start_error(error, run_command) {
 	if (!/address already in use|port is already allocated|ports are not available/i.test(error)) {
 		return `the ${CONTAINER_NAME} container couldn't start: ${first_line(error)}`;
 	}
-	const holder = await find_port_holder();
+	const holder = await find_port_holder(run_command);
 	return holder
 		? `port ${SYNTAX_AUTH_LOCAL_PORT} is in use by ${holder}, so local Syntax Auth can't start. Stop that program, then restart dev.`
 		: `another program is using port ${SYNTAX_AUTH_LOCAL_PORT}, so local Syntax Auth can't start. Stop it, then restart dev.`;
@@ -68,12 +88,16 @@ function start_updater() {
 	updater.unref();
 }
 
-/** @returns {Promise<string | null>} null once Syntax Auth answers, otherwise what is wrong. */
-async function wait_until_ready() {
+/**
+ * @param {import('./container.js').Run} run_command
+ * @param {() => Promise<boolean>} check
+ * @returns {Promise<string | null>} null once Syntax Auth answers, otherwise what is wrong.
+ */
+async function wait_until_ready(run_command, check) {
 	const deadline = Date.now() + READY_TIMEOUT_MS;
 
 	while (Date.now() < deadline) {
-		if (await is_healthy()) {
+		if (await check()) {
 			log(`Ready at ${SYNTAX_AUTH_LOCAL_ORIGIN}`);
 			return null;
 		}
@@ -81,28 +105,52 @@ async function wait_until_ready() {
 	}
 
 	// The container writes its server's errors to stderr, which `docker logs` passes through.
-	const logs = await docker(['logs', '--tail', '20', CONTAINER_NAME]);
+	const logs = await docker(['logs', '--tail', '20', CONTAINER_NAME], run_command);
 	return `local Syntax Auth started but isn't answering at ${SYNTAX_AUTH_LOCAL_ORIGIN} after 3 minutes. Its last log lines:\n${`${logs.stdout}\n${logs.stderr}`.trim()}`;
 }
 
-/** @returns {Promise<string | null>} null once Syntax Auth answers, otherwise what is wrong. */
-async function start_and_wait() {
-	const error = await with_container_lock(start_container);
-	return error ? describe_start_error(error) : wait_until_ready();
+/**
+ * @param {import('./container.js').Run} run_command
+ * @param {() => Promise<boolean>} check
+ * @returns {Promise<string | null>} null once Syntax Auth answers, otherwise what is wrong.
+ */
+async function start_and_wait(run_command, check) {
+	const error = await with_container_lock(() => start_container(run_command, check));
+	return error ? describe_start_error(error, run_command) : wait_until_ready(run_command, check);
 }
 
-/** Makes sure the shared local Syntax Auth is running. Never throws. */
-export async function ensure_syntax_auth() {
+/**
+ * Makes sure the shared local Syntax Auth is running. Never throws. With `can_start: false` (a
+ * site's dev server on Linux, or where nobody is at the Mac's screen) it only checks, and says how
+ * to start it.
+ * @param {EnsureOptions} [options]
+ */
+export async function ensure_syntax_auth({
+	can_start = true,
+	run: run_command = run,
+	is_healthy: check = is_healthy,
+	start_updater: updater = start_updater,
+	warn: report = warn
+} = {}) {
 	try {
-		if (!(await is_healthy())) {
-			const problem = (await ensure_docker()) ?? (await ensure_image()) ?? (await start_and_wait());
+		if (!(await check())) {
+			if (!can_start) {
+				report(
+					`Running signed out: local Syntax Auth isn't running, and this dev server starts it only on a Mac with a person at its screen. Run \`pnpm exec syntax-auth-local\` to start it, then restart dev.`
+				);
+				return;
+			}
+			const problem =
+				(await ensure_docker(run_command)) ??
+				(await ensure_image(run_command)) ??
+				(await start_and_wait(run_command, check));
 			if (problem) {
-				warn(`Running signed out: ${problem}`);
+				report(`Running signed out: ${problem}`);
 				return;
 			}
 		}
 
-		start_updater();
+		if (can_start) updater();
 	} catch (error) {
 		console.error('Syntax Auth local startup failed', error);
 	}

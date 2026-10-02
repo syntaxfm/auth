@@ -10,7 +10,7 @@ import { BlockList, createServer as create_net_server, isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { ensure_docker, run as real_run, with_port_lock } from '../container.js';
+import { ensure_docker, run as real_run, stall_message, with_port_lock } from '../container.js';
 
 const FIXTURES = new URL('./fixtures/', import.meta.url);
 /** @param {string} name */
@@ -338,8 +338,17 @@ export function create_run() {
 		hosts_answer: 'approve',
 		/** @type {'approve' | 'cancel'} */
 		trust_answer: 'approve',
-		/** @type {Map<number, { address: string, process: string, pid: number }[]>} */
+		/** @type {Map<number, { proto?: string, address: string, process: string, pid: number }[]>} */
 		listeners: new Map(),
+		/** How netstat prints: `named` (macOS 13 and later, process:pid) or `numeric` (pid only). */
+		/** @type {'named' | 'numeric' | 'fails'} */
+		netstat: 'named',
+		/** Commands that hang until their time limit, like "docker info". */
+		/** @type {Set<string>} */
+		stalls: new Set(),
+		/** Runs while the password dialog is open, before the hosts script. */
+		/** @type {() => Promise<void>} */
+		while_dialog_open: async () => {},
 		/** @type {Map<number, string>} */
 		processes: new Map(),
 		keychain: { certificates: new Set(), trusted: new Set() },
@@ -351,6 +360,9 @@ export function create_run() {
 	};
 	/** @type {string[][]} */
 	const calls = [];
+	/** Each call's options, in the same order as `calls`. */
+	/** @type {import('../container.js').RunOptions[]} */
+	const call_options = [];
 	const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
 	/** @param {string} stderr */
 	const fail = (stderr, code = 1) => ({ code, stdout: '', stderr });
@@ -359,17 +371,34 @@ export function create_run() {
 		new X509Certificate(await readFile(file)).fingerprint.replaceAll(':', '');
 
 	/** @type {import('../container.js').Run} */
-	const run = async (command, args) => {
+	const run = async (command, args, options = {}) => {
 		calls.push([command, ...args]);
+		call_options.push(options);
+		if (state.stalls.has(`${command} ${args[0]}`)) {
+			await new Promise((resolve) => setTimeout(resolve, options.timeout_ms ?? 60_000));
+			return {
+				code: null,
+				stdout: '',
+				stderr: stall_message(command, args, Number(options.timeout_ms)),
+				timed_out: true
+			};
+		}
 		if (command === 'launchctl') return ok(state.desktop);
 		if (command === 'netstat') {
+			if (state.netstat === 'fails')
+				return fail('netstat: sysctl: net.inet.tcp.pcblist_n: Operation not permitted');
+			const named = state.netstat === 'named';
 			const lines = [...state.listeners].flatMap(([port, listeners]) =>
-				listeners.map(
-					(listener) =>
-						`tcp4       0      0  ${listener.address}.${port}        *.*                    LISTEN                 0            0  131072  131072  ${listener.process}:${listener.pid}    00100 00000006 00000000000c38ca 00000000 00000800      1      0 000000`
+				listeners.map((listener) =>
+					named
+						? `${listener.proto ?? 'tcp4'}       0      0  ${listener.address}.${port}        *.*                    LISTEN                 0            0  131072  131072  ${listener.process}:${listener.pid}    00100 00000006 00000000000c38ca 00000000 00000800      1      0 000000`
+						: `${listener.proto ?? 'tcp4'}       0      0  ${listener.address}.${port}        *.*                    LISTEN      131072 131072    ${listener.pid}      0 0x0000 0x0000 00000000 00000000`
 				)
 			);
-			return ok(['Active Internet connections (including servers)', ...lines].join('\n'));
+			const header = named
+				? 'Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs'
+				: 'Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat shiwat    pid   epid  state    options           gencnt    flags   flags1 usscnt rtncnt fltrs';
+			return ok(['Active Internet connections (including servers)', header, ...lines].join('\n'));
 		}
 		if (command === 'ps') {
 			const name = state.processes.get(Number(args[args.length - 1]));
@@ -380,9 +409,10 @@ export function create_run() {
 				return fail('0:154: execution error: User canceled. (-128)');
 			if (state.hosts_answer === 'timeout')
 				return { code: null, stdout: '', stderr: '', timed_out: true };
+			await state.while_dialog_open();
 			// As root would: the real script, with the arguments the AppleScript passes it.
-			const [script, path, block, flush] = args.slice(-5);
-			return real_run('/bin/sh', ['-c', script, 'syntax-test-hosts', path, block, flush]);
+			const [script, path, block, flush, sha256] = args.slice(-6);
+			return real_run('/bin/sh', ['-c', script, 'syntax-test-hosts', path, block, flush, sha256]);
 		}
 		if (command === 'security') {
 			const [subcommand] = args;
@@ -442,7 +472,7 @@ export function create_run() {
 		if (command === 'open') return fail('Unable to find application');
 		return { code: null, stdout: '', stderr: `spawn ${command} ENOENT` };
 	};
-	return { run, calls, state };
+	return { run, calls, call_options, state };
 }
 
 /** Resolves names the way macOS would with this hosts file and no DNS server. */
@@ -470,7 +500,7 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-local-test-'));
 	const hosts_path = join(directory, 'hosts');
 	await writeFile(hosts_path, hosts);
-	const { run, calls, state } = create_run();
+	const { run, calls, call_options, state } = create_run();
 	const admin_port = caddy_options === false ? await free_port() : undefined;
 	/** @type {Awaited<ReturnType<typeof start_fake_caddy>> | null} */
 	let caddy = caddy_options === false ? null : await start_fake_caddy(caddy_options);
@@ -516,7 +546,8 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 		recheck_ms: 50,
 		dialog_timeout_ms: 1_000,
 		served_certificate_timeout_ms: 300,
-		probe_timeout_ms: 300
+		probe_timeout_ms: 300,
+		command_timeout_ms: 1_000
 	};
 
 	// `docker run` of Syntax's Caddy: starts a Caddy on the admin port with the container's base
@@ -545,6 +576,7 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 		deps,
 		run,
 		calls,
+		call_options,
 		state,
 		hosts_path,
 		logs,

@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { access, constants, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
 
 export const SYNTAX_AUTH_LOCAL_PORT = 37960;
 export const SYNTAX_AUTH_LOCAL_ORIGIN = `http://localhost:${SYNTAX_AUTH_LOCAL_PORT}`;
@@ -39,15 +39,41 @@ export function warn(message) {
 /**
  * @typedef {{ code: number | null, stdout: string, stderr: string, timed_out?: boolean }} RunResult
  * @typedef {(command: string, args: string[], options?: RunOptions) => Promise<RunResult>} Run
- * @typedef {{ input?: string, env?: NodeJS.ProcessEnv, timeout_ms?: number }} RunOptions
+ * @typedef {{ input?: string, env?: NodeJS.ProcessEnv, timeout_ms?: number, kill_grace_ms?: number }} RunOptions
  */
+
+const KILL_GRACE_MS = 2_000;
+
+/**
+ * The command as a person would type it, shortened: long arguments (like a whole script) become "…".
+ * @param {string} command
+ * @param {string[]} args
+ */
+export function describe_command(command, args) {
+	const shown = args.slice(0, 4).map((arg) => (arg.length > 80 || /\s/.test(arg) ? '…' : arg));
+	return [command, ...shown, ...(args.length > 4 ? ['…'] : [])].join(' ');
+}
+
+/**
+ * What a timed-out command reports in place of its stderr.
+ * @param {string} command
+ * @param {string[]} args
+ * @param {number} timeout_ms
+ */
+export function stall_message(command, args, timeout_ms) {
+	const seconds = Math.round(timeout_ms / 1_000);
+	const limit =
+		timeout_ms >= 1_000 ? `${seconds} ${seconds === 1 ? 'second' : 'seconds'}` : `${timeout_ms} ms`;
+	return `\`${describe_command(command, args)}\` didn't finish within ${limit}, so setup stopped it`;
+}
 
 /**
  * Runs a command to completion. Never throws: a missing command gives code null and its error. A
- * command still running after `timeout_ms` is killed and gives `timed_out: true`.
+ * command still running after `timeout_ms` gets SIGTERM, then SIGKILL after `kill_grace_ms`, and
+ * gives `timed_out: true` with a stderr that names the command.
  * @type {Run}
  */
-export function run(command, args, { input, env, timeout_ms } = {}) {
+export function run(command, args, { input, env, timeout_ms, kill_grace_ms = KILL_GRACE_MS } = {}) {
 	return new Promise((resolve) => {
 		const child = spawn(command, args, {
 			env: env ?? process.env,
@@ -56,26 +82,48 @@ export function run(command, args, { input, env, timeout_ms } = {}) {
 		let stdout = '';
 		let stderr = '';
 		let timed_out = false;
-		const timer = timeout_ms
-			? setTimeout(() => {
+		let settled = false;
+		/** @type {NodeJS.Timeout[]} */
+		const timers = [];
+		/** @param {RunResult} result */
+		const finish = (result) => {
+			if (settled) return;
+			settled = true;
+			for (const timer of timers) clearTimeout(timer);
+			resolve(result);
+		};
+		const stalled = () => ({
+			code: null,
+			stdout: stdout.trim(),
+			stderr: stall_message(command, args, Number(timeout_ms)),
+			timed_out: true
+		});
+		if (timeout_ms) {
+			timers.push(
+				setTimeout(() => {
 					timed_out = true;
 					child.kill('SIGTERM');
+					timers.push(
+						setTimeout(() => {
+							child.kill('SIGKILL');
+							// A grandchild may still hold the pipes open; stop waiting for them.
+							timers.push(setTimeout(() => finish(stalled()), kill_grace_ms));
+						}, kill_grace_ms)
+					);
 				}, timeout_ms)
-			: undefined;
+			);
+		}
 		child.stdout.on('data', (chunk) => (stdout += chunk));
 		child.stderr.on('data', (chunk) => (stderr += chunk));
-		child.on('error', (error) => {
-			clearTimeout(timer);
-			resolve({ code: null, stdout, stderr: error.message });
+		child.on('error', (error) => finish({ code: null, stdout, stderr: error.message }));
+		child.on('exit', () => {
+			if (!timed_out) return;
+			child.stdout.destroy();
+			child.stderr.destroy();
+			finish(stalled());
 		});
 		child.on('close', (code) => {
-			clearTimeout(timer);
-			resolve({
-				code,
-				stdout: stdout.trim(),
-				stderr: stderr.trim(),
-				...(timed_out && { timed_out })
-			});
+			finish(timed_out ? stalled() : { code, stdout: stdout.trim(), stderr: stderr.trim() });
 		});
 		child.stdin.on('error', () => {
 			// The command exited before reading its input; `close` reports how it ended.
@@ -84,9 +132,9 @@ export function run(command, args, { input, env, timeout_ms } = {}) {
 	});
 }
 
-/** @param {string[]} args */
-export function docker(args) {
-	return run('docker', args);
+/** @param {string[]} args @param {Run} [run_command] */
+export function docker(args, run_command = run) {
+	return run_command('docker', args);
 }
 
 /** @param {{ code: number | null, stderr: string }} result */
@@ -136,9 +184,12 @@ async function find_docker_binary() {
 // token in a throwaway Docker config. PATH exposes only the docker binary, so Docker cannot fall
 // back to the OS keychain: the token is never saved, and any existing ghcr.io login is untouched.
 // Returns why the app runs signed out (`problem`), or the pull's result.
-/** @returns {Promise<{ problem: string } | { result: { code: number | null, stdout: string, stderr: string } }>} */
-async function pull_as_syntax_team_member() {
-	const user = await run('gh', ['api', 'user', '--jq', '.login']);
+/**
+ * @param {Run} run_command
+ * @returns {Promise<{ problem: string } | { result: { code: number | null, stdout: string, stderr: string } }>}
+ */
+async function pull_as_syntax_team_member(run_command) {
+	const user = await run_command('gh', ['api', 'user', '--jq', '.login']);
 	if (is_missing_command(user)) {
 		return {
 			problem:
@@ -153,14 +204,19 @@ async function pull_as_syntax_team_member() {
 		};
 	}
 
-	const membership = await run('gh', ['api', 'user/memberships/orgs/syntaxfm', '--jq', '.state']);
+	const membership = await run_command('gh', [
+		'api',
+		'user/memberships/orgs/syntaxfm',
+		'--jq',
+		'.state'
+	]);
 	if (membership.code !== 0 || membership.stdout !== 'active') {
 		return { problem: describe_membership_problem(user.stdout, membership) };
 	}
 
 	const [token, context, docker_binary] = await Promise.all([
-		run('gh', ['auth', 'token', '--hostname', 'github.com']),
-		docker(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']),
+		run_command('gh', ['auth', 'token', '--hostname', 'github.com']),
+		docker(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], run_command),
 		find_docker_binary()
 	]);
 	if (token.code !== 0) {
@@ -182,28 +238,31 @@ async function pull_as_syntax_team_member() {
 			DOCKER_CONFIG: config_directory,
 			DOCKER_HOST: context.stdout
 		};
-		const login = await run(
+		const login = await run_command(
 			'docker',
 			['login', 'ghcr.io', '--username', user.stdout, '--password-stdin'],
 			{ input: token.stdout, env }
 		);
 		if (login.code !== 0) return { result: login };
-		return { result: await run('docker', ['pull', '--quiet', IMAGE], { env }) };
+		return { result: await run_command('docker', ['pull', '--quiet', IMAGE], { env }) };
 	} finally {
 		await rm(config_directory, { recursive: true, force: true });
 		await rm(binary_directory, { recursive: true, force: true });
 	}
 }
 
-/** @returns {Promise<string | null>} null once the image is downloaded, otherwise what is wrong. */
-export async function pull_image() {
-	const result = await docker(['pull', '--quiet', IMAGE]);
+/**
+ * @param {Run} [run_command]
+ * @returns {Promise<string | null>} null once the image is downloaded, otherwise what is wrong.
+ */
+export async function pull_image(run_command = run) {
+	const result = await docker(['pull', '--quiet', IMAGE], run_command);
 	if (result.code === 0) return null;
 	if (!is_access_denied(result.stderr)) {
 		return `local Syntax Auth's Docker image couldn't be downloaded: ${first_line(result.stderr)}`;
 	}
 
-	const team_pull = await pull_as_syntax_team_member();
+	const team_pull = await pull_as_syntax_team_member(run_command);
 	if ('problem' in team_pull) {
 		return `local Syntax Auth's Docker image is private to the Syntax team, and ${team_pull.problem}`;
 	}
@@ -215,25 +274,90 @@ export async function pull_image() {
 }
 
 /**
+ * @typedef {{ proto: string, address: string, process: string, pid: number }} Listener
+ */
+
+/**
  * Every TCP listener on `port`, from macOS's `netstat -anv`, which (unlike `lsof`) also shows
- * processes owned by other users, such as a Caddy run by root.
+ * processes owned by other users, such as a Caddy run by root. Columns are found by the header,
+ * which differs between macOS versions: newer ones name the process (`process:pid`, where the name
+ * may contain spaces), older ones give only the `pid`, whose name comes from `ps`. A failed or
+ * unreadable netstat gives `error`, never an empty list, so a busy port is never taken for free.
  * @param {number} port
  * @param {Run} [run_command]
- * @returns {Promise<{ address: string, process: string, pid: number }[]>}
+ * @returns {Promise<{ listeners: Listener[] } | { error: string }>}
  */
 export async function find_port_listeners(port, run_command = run) {
 	const result = await run_command('netstat', ['-anv', '-p', 'tcp']);
-	/** @type {{ address: string, process: string, pid: number }[]} */
-	const listeners = [];
-	for (const line of result.stdout.split('\n')) {
-		// tcp46  0  0  *.443  *.*  LISTEN  0 0 131072 131072  caddy:610  00180 …
-		const match = line.match(
-			/^tcp(?:46|4|6)\s+\d+\s+\d+\s+(\S+)\.(\d+)\s+\S+\s+LISTEN\s+(?:\d+\s+){4}(.+?):(\d+)\s+[0-9a-f]{5}\s/
-		);
-		if (!match || Number(match[2]) !== port) continue;
-		listeners.push({ address: match[1], process: match[3], pid: Number(match[4]) });
+	if (result.code !== 0) {
+		return {
+			error: `\`netstat -anv -p tcp\` failed: ${first_line(result.stderr) || `exit code ${result.code}`}`
+		};
 	}
-	return listeners;
+	const lines = result.stdout.split('\n');
+	const header_index = lines.findIndex((line) => /^Proto\s/.test(line));
+	const header = (lines[header_index] ?? '')
+		.replace('Local Address', 'Local_Address')
+		.replace('Foreign Address', 'Foreign_Address')
+		.trim()
+		.split(/\s+/);
+	const columns = {
+		proto: header.indexOf('Proto'),
+		local: header.indexOf('Local_Address'),
+		state: header.indexOf('(state)'),
+		named: header.indexOf('process:pid'),
+		pid: header.indexOf('pid')
+	};
+	if (
+		header_index === -1 ||
+		columns.proto !== 0 ||
+		columns.local === -1 ||
+		columns.state === -1 ||
+		(columns.named === -1 && columns.pid === -1)
+	) {
+		return {
+			error: `\`netstat -anv -p tcp\` printed a format setup can't read (no "Proto … Local Address … process:pid" or "pid" header)`
+		};
+	}
+
+	/** @type {Listener[]} */
+	const listeners = [];
+	for (const line of lines.slice(header_index + 1)) {
+		const fields = line.trim().split(/\s+/);
+		if (!/^tcp(?:4|6|46)$/.test(fields[0] ?? '') || fields[columns.state] !== 'LISTEN') continue;
+		const local = fields[columns.local] ?? '';
+		const dot = local.lastIndexOf('.');
+		if (Number(local.slice(dot + 1)) !== port) continue;
+
+		let name = '';
+		/** @type {number} */
+		let pid;
+		if (columns.named !== -1) {
+			// The process name may contain spaces: it runs until the field that ends in ":<pid>".
+			const end = fields.findIndex((field, i) => i >= columns.named && /:\d+$/.test(field));
+			const joined = end === -1 ? '' : fields.slice(columns.named, end + 1).join(' ');
+			name = joined.replace(/:\d+$/, '');
+			pid = Number(joined.match(/:(\d+)$/)?.[1]);
+		} else {
+			pid = Number(fields[columns.pid]);
+		}
+		if (!Number.isInteger(pid) || pid <= 0) {
+			return {
+				error: `\`netstat -anv -p tcp\` printed a listener on port ${port} without a process id`
+			};
+		}
+		if (!name) {
+			const command = await run_command('ps', ['-o', 'comm=', '-p', String(pid)]);
+			name = command.code === 0 ? basename(command.stdout.trim()) : '';
+		}
+		listeners.push({
+			proto: fields[0],
+			address: local.slice(0, dot),
+			process: name || 'a program',
+			pid
+		});
+	}
+	return { listeners };
 }
 
 /**
@@ -247,9 +371,12 @@ export function describe_listeners(listeners) {
 	return names.join(' and ');
 }
 
-/** @returns {Promise<string | null>} the program listening on the local port, like "python3 (pid 123)" */
-export async function find_port_holder() {
-	const result = await run('lsof', [
+/**
+ * @param {Run} [run_command]
+ * @returns {Promise<string | null>} the program listening on the local port, like "python3 (pid 123)"
+ */
+export async function find_port_holder(run_command = run) {
+	const result = await run_command('lsof', [
 		'-nP',
 		`-iTCP:${SYNTAX_AUTH_LOCAL_PORT}`,
 		'-sTCP:LISTEN',
@@ -274,38 +401,44 @@ export async function is_healthy() {
 	}
 }
 
-/** @returns {Promise<{ is_running: boolean, image_id: string } | null>} */
-export async function get_container_state() {
-	const result = await docker([
-		'container',
-		'inspect',
-		'--format',
-		'{{.State.Running}} {{.Image}}',
-		CONTAINER_NAME
-	]);
+/**
+ * @param {Run} [run_command]
+ * @returns {Promise<{ is_running: boolean, image_id: string } | null>}
+ */
+export async function get_container_state(run_command = run) {
+	const result = await docker(
+		['container', 'inspect', '--format', '{{.State.Running}} {{.Image}}', CONTAINER_NAME],
+		run_command
+	);
 	if (result.code !== 0) return null;
 
 	const [running, image_id] = result.stdout.split(' ');
 	return { is_running: running === 'true', image_id };
 }
 
-/** @returns {Promise<string | null>} null when the container runs, otherwise why it could not. */
-export async function create_container() {
-	const result = await docker([
-		'run',
-		'--detach',
-		// Forwards stop signals so Syntax Auth's own `pnpm dev` can take the port over immediately.
-		'--init',
-		'--name',
-		CONTAINER_NAME,
-		'--restart',
-		'unless-stopped',
-		'--publish',
-		`127.0.0.1:${SYNTAX_AUTH_LOCAL_PORT}:${SYNTAX_AUTH_LOCAL_PORT}`,
-		'--volume',
-		`${VOLUME_NAME}:/app/.wrangler`,
-		IMAGE
-	]);
+/**
+ * @param {Run} [run_command]
+ * @returns {Promise<string | null>} null when the container runs, otherwise why it could not.
+ */
+export async function create_container(run_command = run) {
+	const result = await docker(
+		[
+			'run',
+			'--detach',
+			// Forwards stop signals so Syntax Auth's own `pnpm dev` can take the port over immediately.
+			'--init',
+			'--name',
+			CONTAINER_NAME,
+			'--restart',
+			'unless-stopped',
+			'--publish',
+			`127.0.0.1:${SYNTAX_AUTH_LOCAL_PORT}:${SYNTAX_AUTH_LOCAL_PORT}`,
+			'--volume',
+			`${VOLUME_NAME}:/app/.wrangler`,
+			IMAGE
+		],
+		run_command
+	);
 	return result.code === 0 || result.stderr.includes(NAME_IN_USE) ? null : result.stderr;
 }
 

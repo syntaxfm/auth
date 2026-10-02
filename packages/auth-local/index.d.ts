@@ -1,7 +1,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-/** Makes sure the shared local Syntax Auth is running. Never throws. */
-export declare function ensure_syntax_auth(): Promise<void>;
+/**
+ * Makes sure the shared local Syntax Auth is running. Never throws. With `can_start: false` it only
+ * checks, and prints the command that starts it.
+ */
+export declare function ensure_syntax_auth(options?: { can_start?: boolean }): Promise<void>;
 
 export interface SyntaxAuthOptions {
 	/**

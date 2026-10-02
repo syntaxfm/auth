@@ -21,6 +21,7 @@
 		"container.js",
 		"update.js",
 		"bin.js",
+		"cli.js",
 		"names.js",
 		"hosts_file.js",
 		"caddy.js",

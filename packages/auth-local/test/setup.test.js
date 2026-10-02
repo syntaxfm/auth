@@ -5,6 +5,8 @@ import { request as https_request } from 'node:https';
 import { after, test } from 'node:test';
 
 import { CADDY_IMAGE, TLS_POLICY_ID, route_id } from '../caddy.js';
+import { parse_setup_args } from '../cli.js';
+import { run } from '../container.js';
 import { BLOCK_BEGIN } from '../hosts_file.js';
 import { PROBE_PATH, create_middleware } from '../plugin.js';
 import { describe_result, run_setup, start_recheck } from '../setup.js';
@@ -312,7 +314,7 @@ test('a port 2019 listener that is not proven to be Caddy is refused and never c
 	assert.deepEqual((await setup_lab(other, await start_dev_server())).problems, [
 		{
 			step: 'HTTPS proxy (Caddy)',
-			problem: `Port ${other.deps.admin_port} answers like Caddy's admin API, but it's held by node (pid 88), which is neither a caddy process nor Syntax's syntax-caddy container, so setup won't change it.`,
+			problem: `Port ${other.deps.admin_port} answers like Caddy's admin API, but 127.0.0.1:${other.deps.admin_port} is held by node (pid 88), which is neither a caddy process nor Syntax's syntax-caddy container, so setup won't change it.`,
 			fix: 'Stop node (pid 88) so setup can start its own Caddy, or run your Caddy as a caddy process, then restart dev.'
 		}
 	]);
@@ -397,15 +399,18 @@ test('without a desktop session nothing changes, and every missing step prints i
 		cleanups.push(() => mac.close());
 		mac.state.desktop = scene.desktop;
 		mac.deps.env = scene.env;
-		const result = await setup_lab(mac, await start_dev_server());
+		const dev = await start_dev_server();
+		const result = await setup_lab(mac, dev);
 		assert.equal(result.state, 'failed');
 		assert.deepEqual(
 			result.problems.map((problem) => problem.step),
 			['Hosts file', 'HTTPS proxy (Caddy)']
 		);
-		assert.match(
-			result.problems[0].fix,
-			/^Run `pnpm exec syntax-auth-local setup lab` in Terminal at this computer's own screen \(or over Screen Sharing\), or add the lines yourself: `printf/
+		assert.ok(
+			result.problems[0].fix.startsWith(
+				`Run \`pnpm exec syntax-auth-local setup lab --port ${dev.port}\` in Terminal at this computer's own screen (or over Screen Sharing), or add the lines yourself: \`printf`
+			),
+			result.problems[0].fix
 		);
 		assert.equal(
 			result.problems[1].problem,
@@ -413,7 +418,7 @@ test('without a desktop session nothing changes, and every missing step prints i
 		);
 		assert.equal(
 			result.problems[1].fix,
-			"Run `pnpm exec syntax-auth-local setup lab` in Terminal at this computer's own screen (or over Screen Sharing), then restart dev."
+			`Run \`pnpm exec syntax-auth-local setup lab --port ${dev.port}\` in Terminal at this computer's own screen (or over Screen Sharing), then restart dev.`
 		);
 		assert.equal(await mac.read_hosts(), SYSTEM_HOSTS);
 		assert.deepEqual(mac.caddy?.writes, []);
@@ -515,4 +520,249 @@ test('a probe request reaches the app only through its https name', async () => 
 		}).end();
 	});
 	assert.equal(answer, 'app');
+});
+
+/**
+ * Setup on a Mac whose admin port has these listeners, with Caddy's API answering on 127.0.0.1.
+ * @param {{ proto?: string, address: string, process: string, pid: number }[]} listeners
+ */
+async function setup_with_admin_listeners(listeners) {
+	const mac = await create_mac();
+	cleanups.push(() => mac.close());
+	mac.state.listeners.set(mac.deps.admin_port, listeners);
+	mac.state.processes.set(88, '/usr/local/bin/node');
+	return { mac, result: await setup_lab(mac, await start_dev_server()) };
+}
+
+test('Caddy is proven by the process on the very address its admin API answered on', async () => {
+	const caddy = { address: '100.100.100.100', process: 'caddy', pid: 610 };
+	const node = { address: '127.0.0.1', process: 'node', pid: 88 };
+
+	// Node answers on 127.0.0.1; a Caddy on another address proves nothing.
+	const tailnet = await setup_with_admin_listeners([node, caddy]);
+	const address = `127.0.0.1:${tailnet.mac.deps.admin_port}`;
+	assert.deepEqual(tailnet.result.problems, [
+		{
+			step: 'HTTPS proxy (Caddy)',
+			problem: `Port ${tailnet.mac.deps.admin_port} answers like Caddy's admin API, but ${address} is held by node (pid 88), which is neither a caddy process nor Syntax's syntax-caddy container, so setup won't change it.`,
+			fix: 'Stop node (pid 88) so setup can start its own Caddy, or run your Caddy as a caddy process, then restart dev.'
+		}
+	]);
+	assert.deepEqual(tailnet.mac.caddy?.writes, []);
+
+	// A specific address wins over a wildcard: node on 127.0.0.1 answers, not Caddy on *.
+	const wildcard = await setup_with_admin_listeners([
+		{ ...caddy, proto: 'tcp46', address: '*' },
+		node
+	]);
+	assert.match(wildcard.result.problems[0].problem, /is held by node \(pid 88\)/);
+	assert.deepEqual(wildcard.mac.caddy?.writes, []);
+
+	// Two programs on the same address: setup can't tell which answered.
+	const shared = await setup_with_admin_listeners([{ ...caddy, address: '127.0.0.1' }, node]);
+	assert.deepEqual(shared.result.problems, [
+		{
+			step: 'HTTPS proxy (Caddy)',
+			problem: `More than one program listens on 127.0.0.1:${shared.mac.deps.admin_port} (caddy (pid 610) and node (pid 88)), so setup can't tell which one answers like Caddy's admin API, and won't change it.`,
+			fix: "Stop the one that isn't your Caddy, then restart dev."
+		}
+	]);
+	assert.deepEqual(shared.mac.caddy?.writes, []);
+
+	// Only an IPv6-only Caddy and one on another address: nothing listed owns 127.0.0.1.
+	const ipv6 = await setup_with_admin_listeners([{ ...caddy, proto: 'tcp6', address: '*' }, caddy]);
+	assert.match(
+		ipv6.result.problems[0].problem,
+		/but netstat shows no program listening on 127\.0\.0\.1:\d+ \(only caddy \(pid 610\), on other addresses\), so setup can't tell which program answered and won't change it\.$/
+	);
+	assert.deepEqual(ipv6.mac.caddy?.writes, []);
+
+	// A dual-stack wildcard Caddy, or Caddy on 127.0.0.1 beside a wildcard node, is the one.
+	for (const listeners of [
+		[{ ...caddy, proto: 'tcp46', address: '*' }],
+		[
+			{ ...caddy, address: '127.0.0.1' },
+			{ ...node, address: '*' }
+		]
+	]) {
+		const { result } = await setup_with_admin_listeners(listeners);
+		assert.equal(result.state, 'worked', JSON.stringify(result.problems));
+	}
+});
+
+/**
+ * @param {Awaited<ReturnType<typeof create_mac>>} mac
+ * @param {(server: { routes: unknown[], errors?: unknown }) => void} change
+ */
+function change_https_server(mac, change) {
+	change(/** @type {{ routes: unknown[] }} */ (mac.caddy?.config.apps?.http?.servers?.srv0));
+}
+
+test('a foreign route for the name at any depth is refused before anything is written', async () => {
+	const lab_host = (/** @type {string[]} */ host) => ({ match: [{ host }], handle: [] });
+	/** @type {[string, (server: { routes: unknown[], errors?: unknown }) => void, string][]} */
+	const scenes = [
+		[
+			'a subroute',
+			(server) =>
+				server.routes.push({
+					match: [{ host: ['robo.online'] }],
+					handle: [{ handler: 'subroute', routes: [lab_host(['lab.syntax.test'])] }]
+				}),
+			'routes/1/handle/0/routes/0'
+		],
+		[
+			'a wildcard two subroutes down',
+			(server) =>
+				server.routes.push({
+					handle: [
+						{
+							handler: 'subroute',
+							routes: [{ handle: [{ handler: 'subroute', routes: [lab_host(['*.Syntax.TEST'])] }] }]
+						}
+					]
+				}),
+			'routes/1/handle/0/routes/0/handle/0/routes/0'
+		],
+		[
+			'a host list with other names',
+			(server) => server.routes.push(lab_host(['a.example', 'LAB.syntax.test'])),
+			'routes/1'
+		],
+		[
+			'a second matcher set',
+			(server) =>
+				server.routes.push({
+					match: [{ path: ['/x'] }, { host: ['lab.syntax.test'], path: ['/y'] }]
+				}),
+			'routes/1'
+		],
+		[
+			'an expression',
+			(server) =>
+				server.routes.push({ match: [{ expression: "{http.request.host} == 'lab.syntax.test'" }] }),
+			'routes/1'
+		],
+		[
+			'an error route',
+			(server) => (server.errors = { routes: [lab_host(['lab.syntax.test'])] }),
+			'errors/routes/0'
+		],
+		[
+			'a route with an id',
+			(server) => server.routes.unshift({ '@id': 'scotts-lab', ...lab_host(['lab.syntax.test']) }),
+			'the route "@id": "scotts-lab" at routes/0'
+		]
+	];
+	for (const [scene, change, where] of scenes) {
+		const mac = await create_mac();
+		cleanups.push(() => mac.close());
+		change_https_server(mac, change);
+		assert.deepEqual(
+			(await setup_lab(mac, await start_dev_server())).problems,
+			[
+				{
+					step: 'HTTPS proxy (Caddy)',
+					problem: `Caddy already has a route for lab.syntax.test that setup didn't add (${where} of server srv0), so setup won't take it over.`,
+					fix: 'Remove that route (or its site block) from your Caddy config, reload Caddy, then restart dev.'
+				}
+			],
+			scene
+		);
+		assert.deepEqual(mac.caddy?.writes, [], scene);
+	}
+
+	// Other names, a `not` matcher, and a path that merely contains the name claim nothing.
+	const mac = await create_mac();
+	cleanups.push(() => mac.close());
+	change_https_server(mac, (server) =>
+		server.routes.push(
+			lab_host(['other.syntax.test', 'lab.syntax.test.example', '*.lab.syntax.test']),
+			{ match: [{ not: [{ host: ['lab.syntax.test'] }] }], handle: [] },
+			{ match: [{ path: ['/lab.syntax.test'] }], handle: [] }
+		)
+	);
+	const result = await setup_lab(mac, await start_dev_server());
+	assert.equal(result.state, 'worked', JSON.stringify(result.problems));
+});
+
+test('a busy port is never taken for free: numeric netstat is read, and a failed netstat stops setup', async () => {
+	// Older macOS prints only the pid; its name comes from ps.
+	const numeric = await create_mac({ caddy: false });
+	cleanups.push(() => numeric.close());
+	numeric.state.netstat = 'numeric';
+	numeric.state.listeners.set(numeric.deps.https_port, [{ address: '*', process: '', pid: 4242 }]);
+	numeric.state.processes.set(4242, '/usr/local/sbin/nginx');
+	assert.equal(
+		(await setup_lab(numeric, await start_dev_server())).problems[0].problem,
+		`Port ${numeric.deps.https_port} is in use by nginx (pid 4242), so Syntax's Caddy container can't start there.`
+	);
+	assert.ok(!numeric.commands().includes('docker run'));
+
+	const failing = await create_mac({ caddy: false });
+	cleanups.push(() => failing.close());
+	failing.state.netstat = 'fails';
+	assert.deepEqual((await setup_lab(failing, await start_dev_server())).problems, [
+		{
+			step: 'HTTPS proxy (Caddy)',
+			problem: `Setup couldn't check whether port ${failing.deps.https_port} is free for Syntax's Caddy container: \`netstat -anv -p tcp\` failed: netstat: sysctl: net.inet.tcp.pcblist_n: Operation not permitted.`,
+			fix: 'Run `netstat -anv -p tcp` in Terminal to see why it fails, then restart dev.'
+		}
+	]);
+	assert.ok(!failing.commands().includes('docker run'));
+
+	// Proving a running Caddy fails closed too.
+	const unproven = await create_mac();
+	cleanups.push(() => unproven.close());
+	unproven.state.netstat = 'fails';
+	assert.match(
+		(await setup_lab(unproven, await start_dev_server())).problems[0].problem,
+		/^Setup couldn't check which program answers Caddy's admin API on 127\.0\.0\.1:\d+: `netstat -anv -p tcp` failed: /
+	);
+	assert.deepEqual(unproven.caddy?.writes, []);
+});
+
+test('every command setup runs has a time limit, and a stalled one stops setup naming it', async () => {
+	const mac = await create_mac({ caddy: false });
+	cleanups.push(() => mac.close());
+	assert.equal((await setup_lab(mac, await start_dev_server())).state, 'worked');
+	const unlimited = mac.calls.filter((_, i) => !(Number(mac.call_options[i].timeout_ms) > 0));
+	assert.deepEqual(unlimited, []);
+	assert.ok(mac.commands().includes('docker run'));
+
+	const stalled = await create_mac({ caddy: false });
+	cleanups.push(() => stalled.close());
+	stalled.deps.command_timeout_ms = 200;
+	stalled.state.stalls.add('docker info');
+	assert.deepEqual((await setup_lab(stalled, await start_dev_server())).problems, [
+		{
+			step: 'Setup',
+			problem:
+				"Setup stopped: `docker info --format {{.ServerVersion}}` didn't finish within 200 ms, so setup stopped it.",
+			fix: 'Restart dev to try again.'
+		}
+	]);
+});
+
+test('every printed command runs this same setup: name, port, and path routes', async () => {
+	const mac = await create_mac();
+	cleanups.push(() => mac.close());
+	mac.state.desktop = 'Background';
+	const dev = await start_dev_server();
+	const parties = await start_server('parties');
+	const result = await setup_lab(mac, dev, parties);
+	const commands = result.problems.map((problem) => problem.fix.match(/^Run `([^`]+)`/)?.[1]);
+	const expected = `pnpm exec syntax-auth-local setup lab --port ${dev.port} --route '/parties/*=${parties}'`;
+	assert.deepEqual(commands, [expected, expected]);
+
+	// Split as a shell would (the quotes keep `*` from expanding), then read as the CLI does.
+	const split = await run('/bin/sh', [
+		'-c',
+		`printf '%s\\n' ${expected.replace('pnpm exec syntax-auth-local ', '')}`
+	]);
+	const [subcommand, ...args] = split.stdout.split('\n');
+	assert.equal(subcommand, 'setup');
+	assert.deepEqual(parse_setup_args(args), {
+		options: { name: 'lab', port: dev.port, routes: [{ path: '/parties/*', port: parties }] }
+	});
 });

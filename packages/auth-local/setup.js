@@ -60,6 +60,7 @@ export const STEPS = {
  * @property {number} dialog_timeout_ms
  * @property {number} served_certificate_timeout_ms how long Caddy may take to serve a new certificate
  * @property {number} probe_timeout_ms how long https://<name> may take to reach this dev server
+ * @property {number} command_timeout_ms how long any command without its own limit may run
  */
 
 /** @returns {SetupDeps} */
@@ -85,21 +86,54 @@ export function default_setup_deps() {
 		recheck_ms: 15_000,
 		dialog_timeout_ms: 300_000,
 		served_certificate_timeout_ms: 15_000,
-		probe_timeout_ms: 10_000
+		probe_timeout_ms: 10_000,
+		command_timeout_ms: 30_000
 	};
 }
 
-/** @param {SiteName} name */
-export function setup_command(name) {
+/**
+ * The terminal command that runs this same setup: the name, its port, and its path routes. Paths
+ * are single-quoted so a shell never expands their `*`; check_options and the CLI refuse quotes.
+ * @param {SetupOptions} options
+ */
+export function setup_command({ name, port, routes = [] }) {
 	// Syntax Auth's own repository runs the package from its source.
-	return name === 'auth'
-		? 'node packages/auth-local/bin.js setup auth'
-		: `pnpm exec syntax-auth-local setup ${name}`;
+	const command =
+		name === 'auth'
+			? 'node packages/auth-local/bin.js setup auth'
+			: `pnpm exec syntax-auth-local setup ${name}`;
+	const port_flag =
+		port && !(name === 'auth' && port === SYNTAX_AUTH_LOCAL_PORT) ? [`--port ${port}`] : [];
+	const route_flags = routes.map((route) => `--route '${route.path}=${route.port}'`);
+	return [command, ...port_flag, ...route_flags].join(' ');
+}
+
+/**
+ * The deps with a time limit on every command that has none. A command that stalls stops setup
+ * with a message naming it; a command with its own limit (a dialog, a download) reports it itself.
+ * @template {{ run: import('./container.js').Run, command_timeout_ms: number }} T
+ * @param {T} deps
+ * @returns {T}
+ */
+export function with_command_timeouts(deps) {
+	const run_command = deps.run;
+	return {
+		...deps,
+		run: async (command, args, options = {}) => {
+			if (options.timeout_ms) return run_command(command, args, options);
+			const result = await run_command(command, args, {
+				...options,
+				timeout_ms: deps.command_timeout_ms
+			});
+			if (result.timed_out) throw new Error(result.stderr);
+			return result;
+		}
+	};
 }
 
 /**
  * Whether a person at this Mac's own screen can answer a password or approval dialog.
- * @param {SetupDeps} deps
+ * @param {{ run: import('./container.js').Run, env: NodeJS.ProcessEnv }} deps
  */
 export async function has_desktop(deps) {
 	if (deps.env.SSH_CONNECTION || deps.env.CI) return false;
@@ -305,9 +339,9 @@ async function run_steps(options, sites, can_ask, deps) {
 export async function run_setup(options, deps) {
 	if (deps.platform !== 'darwin') return { state: 'unsupported', problems: [] };
 	try {
-		const can_ask = await has_desktop(deps);
+		const step_deps = { ...with_command_timeouts(deps), setup_command: setup_command(options) };
+		const can_ask = await has_desktop(step_deps);
 		const sites = get_sites(options);
-		const step_deps = { ...deps, setup_command: setup_command(options.name) };
 		return await deps.setup_lock(() => run_steps(options, sites, can_ask, step_deps));
 	} catch (error) {
 		return failed([unexpected(error)]);
@@ -318,7 +352,7 @@ export async function run_setup(options, deps) {
 function unexpected(error) {
 	return {
 		step: STEPS.setup,
-		problem: `Setup stopped: ${error instanceof Error ? error.message : String(error)}.`,
+		problem: `Setup stopped: ${(error instanceof Error ? error.message : String(error)).replace(/\.?$/, '.')}`,
 		fix: 'Restart dev to try again.'
 	};
 }
@@ -348,7 +382,7 @@ export async function recheck(options, context, deps) {
 			const problem = await check_worked(deps, options, context);
 			return problem ? failed([problem]) : { state: 'worked', problems: [], context };
 		}
-		const step_deps = { ...deps, setup_command: setup_command(options.name) };
+		const step_deps = { ...with_command_timeouts(deps), setup_command: setup_command(options) };
 		return await deps.setup_lock(async () => {
 			const found = await find_caddy(step_deps, { can_change: false });
 			if ('problem' in found) return failed([{ step: STEPS.proxy, ...found }]);

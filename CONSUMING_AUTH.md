@@ -170,17 +170,25 @@ that is already done is skipped, so after the first start nothing asks again:
 
 1. **Hosts file.** `/etc/hosts` gets any missing `127.0.0.1` and `::1` entries for the three names,
    in one block marked `# >>> syntax.test` … `# <<< syntax.test`. Changing it asks for your password
-   (or Touch ID) in a macOS dialog. A fixed script, never a file anyone could edit, then re-reads the
-   file, saves it as `/etc/hosts.syntax-test.bak`, rewrites only that block through a copy moved
-   into place, and clears the DNS cache; an interrupted edit leaves the old file or the new one.
-   Other lines stay as they are, and a name another line points elsewhere is left alone and
-   reported. One setup runs at a time on the machine, and a dialog left open closes after 5 minutes.
-2. **HTTPS proxy.** If Caddy's admin API answers on `localhost:2019` and is proven to be Caddy
-   (it answers as Caddy's does, and the program listening is `caddy`), setup adds its routes there,
-   first in the port 443 server, and leaves every other route alone. Otherwise it starts Syntax's
+   (or Touch ID) in a macOS dialog. A fixed script, never a file anyone could edit, then checks the
+   file is still the one setup planned from (if another program changed it while the dialog was
+   open, it changes nothing and says so), saves it as `/etc/hosts.syntax-test.bak`, rewrites only
+   that block through a copy moved into place, and clears the DNS cache; an interrupted edit leaves
+   the old file or the new one. Every byte outside the block stays as it was, CRLF line endings and
+   a missing final newline included, and a name another line points elsewhere is left alone and
+   reported. A damaged block (a marker without its partner, two blocks, or an altered marker line)
+   is refused with its fix. One setup runs at a time on the machine, and a dialog left open closes
+   after 5 minutes.
+2. **HTTPS proxy.** If Caddy's admin API answers on `127.0.0.1:2019` and is proven to be Caddy
+   (it answers as Caddy's does, and the one program listening on `127.0.0.1:2019`, or on a wildcard
+   address that covers it, is `caddy`), setup adds its routes there, first in the port 443 server,
+   and leaves every other route alone. If a route it didn't add matches a name at any depth (inside
+   a subroute, in a host list, or by a wildcard such as `*.syntax.test`), setup names that route and
+   changes nothing. Otherwise it starts Syntax's
    own `syntax-caddy` container from the official Caddy image, pinned by digest, published on
    `127.0.0.1` only (ports 443, 80, and 2019), with its certificates in a Docker volume; a program
-   already on one of those ports is named instead. Each name gets a route with the `@id`
+   already on one of those ports is named instead, and if setup can't read which programs listen,
+   it stops rather than assume the ports are free. Each name gets a route with the `@id`
    `syntax-test-<name>` (`syntax-test-auth` forwards to port 37960 on every start), plus one
    `tls internal` certificate policy, `syntax-test-tls`. Only this computer and its tailnet
    (`100.64.0.0/10`) get through; any other client gets a 403. While dev runs, setup checks every
@@ -196,11 +204,16 @@ Then the dev server prints `https://<name> is ready.`, and page loads on `localh
 `127.0.0.1`) go to the same path on the https name; scripts' requests are never redirected. If a
 step fails, the dev server prints the step, what failed, and its fix, keeps running on `localhost`,
 and answers page loads there with a page naming the same, with a link to keep that browser on
-`localhost` for now. A retry (restart dev) is always safe. Where nobody can answer a dialog (over
-SSH, or with `CI` set), setup changes nothing and prints each fix, such as running
-`pnpm exec syntax-auth-local setup <name>` in Terminal at the Mac's own screen. On Linux and Windows
-it changes nothing and says that automatic setup is macOS-only for now. The routes stay in Caddy
-when dev stops; Syntax Auth's `README.md` shows how to undo every step.
+`localhost` for now. A retry (restart dev) is always safe, and a command that stalls is stopped
+with a message naming it. Where nobody can answer a dialog (over SSH, or with `CI` set), setup
+changes nothing and prints each fix, such as running
+`pnpm exec syntax-auth-local setup lab --port 1337 --route '/parties/*=1999'` (the dev server
+prints it with its own port and routes) in Terminal at the Mac's own screen; `setup lab` and
+`setup website` need `--port`. On Linux and Windows it changes nothing and says that automatic
+setup is macOS-only for now. In both cases a named dev server also leaves Docker and the local
+Syntax Auth container alone: if Syntax Auth isn't running, it says to start it with
+`pnpm exec syntax-auth-local`. The routes stay in Caddy when dev stops; Syntax Auth's `README.md`
+shows how to undo every step.
 
 On those names:
 

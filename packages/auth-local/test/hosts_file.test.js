@@ -1,6 +1,7 @@
 // The hosts file edit, with the real root script run on a temporary file in place of /etc/hosts.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
@@ -25,9 +26,29 @@ const ensure = (mac, can_ask = true) =>
 		flush: false
 	});
 
-/** @param {string} path @param {string} block */
-const run_script = (path, block) =>
-	run('/bin/sh', ['-c', HOSTS_SCRIPT, 'syntax-test-hosts', path, block, 'no-flush']);
+/** @param {string} path */
+const sha256_of = async (path) =>
+	createHash('sha256')
+		.update(await readFile(path))
+		.digest('hex');
+
+/**
+ * The root script as the AppleScript runs it, against the file as it is now unless `sha256` says
+ * otherwise.
+ * @param {string} path
+ * @param {string} block
+ * @param {{ sha256?: string, flush?: string }} [options]
+ */
+const run_script = async (path, block, { sha256, flush = 'no-flush' } = {}) =>
+	run('/bin/sh', [
+		'-c',
+		HOSTS_SCRIPT,
+		'syntax-test-hosts',
+		path,
+		block,
+		flush,
+		sha256 ?? (await sha256_of(path))
+	]);
 
 test('adds every missing name once, and a second start asks nothing', async () => {
 	const mac = await create_mac({ caddy: false });
@@ -72,7 +93,7 @@ test('a damaged block is refused by the plan and by the root script, and nothing
 	const mac = await create_mac({ caddy: false, hosts: damaged });
 	try {
 		assert.deepEqual(await ensure(mac), {
-			problem: `The syntax.test block in ${mac.hosts_path} is damaged: it needs exactly one "${BLOCK_BEGIN}" line followed by one "${BLOCK_END}" line.`,
+			problem: `The syntax.test block in ${mac.hosts_path} is damaged: it needs exactly one "${BLOCK_BEGIN}" line followed by one "${BLOCK_END}" line, and it has 1 start line and 0 end lines.`,
 			fix: `Fix or delete those lines with \`sudo nano ${mac.hosts_path}\`, then restart dev.`
 		});
 		assert.deepEqual(mac.commands(), []);
@@ -145,6 +166,7 @@ test('an edit interrupted at any moment leaves the old file or the new one, and 
 		await run_script(mac.hosts_path, plan.block);
 		const duration_ms = Date.now() - started;
 		const seen = new Set();
+		const sha256 = createHash('sha256').update(original).digest('hex');
 		for (let attempt = 0; attempt < 30; attempt++) {
 			await writeFile(mac.hosts_path, original);
 			const child = spawn('/bin/sh', [
@@ -153,7 +175,8 @@ test('an edit interrupted at any moment leaves the old file or the new one, and 
 				'syntax-test-hosts',
 				mac.hosts_path,
 				plan.block,
-				'no-flush'
+				'no-flush',
+				sha256
 			]);
 			const closed = new Promise((resolve) => child.once('close', resolve));
 			await new Promise((resolve) => setTimeout(resolve, (attempt / 25) * duration_ms));
@@ -188,6 +211,143 @@ test('two dev servers starting at once leave one valid block, and only one asks'
 		]);
 		assert.equal(await mac.read_hosts(), `${SYSTEM_HOSTS}${FULL_BLOCK}\n`);
 		assert.equal(mac.commands().filter((command) => command === 'osascript -e').length, 1);
+	} finally {
+		await mac.close();
+	}
+});
+
+test('an entry another program adds while the dialog is open stops the edit, and the next start leaves it alone', async () => {
+	const mac = await create_mac({ caddy: false });
+	try {
+		const added = `${SYSTEM_HOSTS}10.1.2.3 lab.syntax.test\n`;
+		mac.state.while_dialog_open = () => writeFile(mac.hosts_path, added);
+		assert.deepEqual(await ensure(mac), {
+			problem: `${mac.hosts_path} changed while the password dialog was open (another program edited it), so setup left it as it is.`,
+			fix: 'Restart dev to try again: setup plans from the file as it is then.'
+		});
+		assert.equal(await mac.read_hosts(), added);
+		await assert.rejects(access(`${mac.hosts_path}.syntax-test.bak`));
+
+		mac.state.while_dialog_open = async () => {};
+		assert.deepEqual(await ensure(mac), {
+			changed: true,
+			elsewhere: [{ hostname: 'lab.syntax.test', address: '10.1.2.3' }]
+		});
+		assert.equal(
+			await mac.read_hosts(),
+			`${added}${BLOCK_BEGIN}\n127.0.0.1 auth.syntax.test syntax.test\n::1 auth.syntax.test syntax.test\n${BLOCK_END}\n`
+		);
+	} finally {
+		await mac.close();
+	}
+});
+
+test('the root script checks its arguments and changes nothing on a bad one', async () => {
+	const mac = await create_mac({ caddy: false });
+	try {
+		for (const [
+			block,
+			options,
+			message
+		] of /** @type {[string, { sha256?: string, flush?: string }, RegExp][]} */ ([
+			['10.0.0.1 lab.syntax.test', {}, /aren't \.syntax\.test entries/],
+			['127.0.0.1 evil.example', {}, /aren't \.syntax\.test entries/],
+			["127.0.0.1 lab.syntax.test\n127.0.0.1 x'; rm -rf /", {}, /aren't \.syntax\.test entries/],
+			['127.0.0.1 lab.syntax.test', { sha256: 'abc' }, /malformed checksum/],
+			['127.0.0.1 lab.syntax.test', { sha256: `${'A'.repeat(64)}` }, /malformed checksum/],
+			['127.0.0.1 lab.syntax.test', { flush: 'sometimes' }, /unknown flush argument/]
+		])) {
+			const result = await run_script(mac.hosts_path, block, options);
+			assert.equal(result.code, 2, block);
+			assert.match(result.stderr, message);
+			assert.equal(await mac.read_hosts(), SYSTEM_HOSTS);
+		}
+		const stale = await run_script(mac.hosts_path, '127.0.0.1 lab.syntax.test', {
+			sha256: '0'.repeat(64)
+		});
+		assert.equal(stale.code, 4);
+		assert.equal(
+			stale.stderr,
+			`${mac.hosts_path} changed while the password dialog was open, so setup left it as it is.`
+		);
+		assert.equal(await mac.read_hosts(), SYSTEM_HOSTS);
+	} finally {
+		await mac.close();
+	}
+});
+
+test('CRLF lines, damaged or repeated blocks, and a missing final newline are read alike by the plan and the root script', async () => {
+	const block_lines =
+		'127.0.0.1 auth.syntax.test lab.syntax.test syntax.test\n::1 auth.syntax.test lab.syntax.test syntax.test';
+	const damaged = {
+		'a CRLF start line without an end line': `${SYSTEM_HOSTS}${BLOCK_BEGIN}\r\n127.0.0.1 lab.syntax.test\r\n`,
+		'two blocks': `${SYSTEM_HOSTS}${FULL_BLOCK}\n${FULL_BLOCK}\n`,
+		'an end line before the start line': `${SYSTEM_HOSTS}${BLOCK_END}\n${BLOCK_BEGIN}\n`,
+		'an altered start line': `${SYSTEM_HOSTS}${BLOCK_BEGIN} \n${block_lines}\n${BLOCK_END}\n`,
+		'an altered marker alone': `${SYSTEM_HOSTS}# >>> syntax.test: added by hand\n127.0.0.1 lab.syntax.test\n`,
+		'a lone end line': `${SYSTEM_HOSTS}${BLOCK_END}\r\n`
+	};
+	for (const [scene, text] of Object.entries(damaged)) {
+		const mac = await create_mac({ caddy: false, hosts: text });
+		try {
+			const result = await ensure(mac);
+			assert.ok('problem' in result, scene);
+			assert.match(result.problem, /is damaged: it needs exactly one/, scene);
+			assert.deepEqual(mac.commands(), [], scene);
+			const ran = await run_script(mac.hosts_path, '127.0.0.1 lab.syntax.test');
+			assert.equal(ran.code, 3, scene);
+			assert.equal(await mac.read_hosts(), text, scene);
+		} finally {
+			await mac.close();
+		}
+	}
+
+	// A whole CRLF block is current: nothing to ask.
+	const crlf = `${SYSTEM_HOSTS.replaceAll('\n', '\r\n')}${FULL_BLOCK.replaceAll('\n', '\r\n')}\r\n`;
+	const current = await create_mac({ caddy: false, hosts: crlf });
+	try {
+		assert.deepEqual(await ensure(current), { changed: false, elsewhere: [] });
+		assert.deepEqual(current.commands(), []);
+	} finally {
+		await current.close();
+	}
+
+	// Rewriting keeps every byte outside the block: CRLF endings and a missing final newline.
+	const before = `127.0.0.1\tlocalhost\r\n${BLOCK_BEGIN}\r\n::1 lab.syntax.test\r\n${BLOCK_END}\r\n10.1.2.4 nas.home\r\n# no final newline`;
+	const rewrite = await create_mac({ caddy: false, hosts: before });
+	try {
+		assert.deepEqual(await ensure(rewrite), { changed: true, elsewhere: [] });
+		assert.equal(
+			await rewrite.read_hosts(),
+			`127.0.0.1\tlocalhost\r\n${FULL_BLOCK}\n10.1.2.4 nas.home\r\n# no final newline`
+		);
+	} finally {
+		await rewrite.close();
+	}
+
+	// Appending to a file without a final newline starts the block on its own line.
+	const unterminated = `${SYSTEM_HOSTS}# last line`;
+	const append = await create_mac({ caddy: false, hosts: unterminated });
+	try {
+		assert.deepEqual(await ensure(append), { changed: true, elsewhere: [] });
+		assert.equal(await append.read_hosts(), `${unterminated}\n${FULL_BLOCK}\n`);
+	} finally {
+		await append.close();
+	}
+});
+
+test('without a person at the screen, the printed command also works on a file without a final newline', async () => {
+	const unterminated = `${SYSTEM_HOSTS}# last line`;
+	const mac = await create_mac({ caddy: false, hosts: unterminated });
+	try {
+		const result = await ensure(mac, false);
+		assert.ok('problem' in result);
+		const command = result.fix.match(/`(printf .*)`$/)?.[1];
+		assert.ok(command, result.fix);
+		const ran = await run('/bin/sh', ['-c', command.replace('sudo tee', 'tee')]);
+		assert.equal(ran.code, 0, ran.stderr);
+		assert.equal(await mac.read_hosts(), `${unterminated}\n${FULL_BLOCK}\n`);
+		assert.deepEqual(await ensure(mac, false), { changed: false, elsewhere: [] });
 	} finally {
 		await mac.close();
 	}

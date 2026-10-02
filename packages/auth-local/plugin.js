@@ -8,12 +8,21 @@ import {
 	SITE_LABELS,
 	SYNTAX_TEST_ALLOWED_HOST,
 	get_hostname,
+	has_space_or_control,
 	is_loopback_hostname,
+	is_route_path,
 	is_site_name,
 	site_url
 } from './names.js';
 import { render_problem_page } from './problem_page.js';
-import { STEPS, describe_result, run_setup, start_recheck } from './setup.js';
+import {
+	STEPS,
+	describe_result,
+	has_desktop,
+	run_setup,
+	start_recheck,
+	with_command_timeouts
+} from './setup.js';
 
 export const PROBE_PATH = '/__syntax_auth_local/probe';
 export const USE_LOCALHOST_PATH = '/__syntax_auth_local/use-localhost';
@@ -21,7 +30,7 @@ export const USE_LOCALHOST_PATH = '/__syntax_auth_local/use-localhost';
 /**
  * @typedef {import('./names.js').SiteName} SiteName
  * @typedef {{ name?: SiteName, port?: number, routes?: { path: string, port: number }[] }} SyntaxAuthOptions
- * @typedef {import('./setup.js').SetupDeps & { ensure_syntax_auth: () => Promise<void> }} PluginDeps
+ * @typedef {import('./setup.js').SetupDeps & { ensure_syntax_auth: (options?: { can_start?: boolean }) => Promise<void> }} PluginDeps
  * @typedef {import('./setup.js').SetupResult | { state: 'running', problems: [] }} SiteStatus
  * @typedef {import('node:http').IncomingMessage} Request
  * @typedef {import('node:http').ServerResponse} Response
@@ -49,9 +58,9 @@ function check_options({ name, port, routes }) {
 		throw new Error('syntax_auth(): routes needs a name and must be an array of { path, port }.');
 	}
 	for (const route of routes ?? []) {
-		if (typeof route?.path !== 'string' || !route.path.startsWith('/') || !is_port(route.port)) {
+		if (!is_route_path(route?.path) || !is_port(route.port)) {
 			throw new Error(
-				`syntax_auth(): each route needs a path starting with "/" and a port number, not ${JSON.stringify(route)}.`
+				`syntax_auth(): each route needs a path starting with "/" (without spaces, quotes, or backslashes) and a port number, not ${JSON.stringify(route)}.`
 			);
 		}
 	}
@@ -76,12 +85,25 @@ function has_cookie(request, name) {
 		.some((pair) => pair.split('=', 1)[0].trim() === name);
 }
 
-// Only a path on this same server, never another origin.
-/** @param {string | null} target */
-function safe_path(target) {
-	return target && target.startsWith('/') && !target.startsWith('//') && !target.includes('\\')
-		? target
-		: '/';
+/**
+ * Where the "use localhost" link may send the browser: only a path on this same server. A target
+ * with a control character or a backslash (which browsers drop or read as "/", turning "/\t/x" or
+ * "/\\x" into "//x", another origin) is refused; the rest is resolved against this request's own
+ * origin and kept only when the origin stays the same. Anything else goes to "/".
+ * @param {string | null} target
+ * @param {string | undefined} host the request's Host header
+ */
+export function safe_destination(target, host) {
+	if (!target || !target.startsWith('/') || target.includes('\\') || has_space_or_control(target)) {
+		return '/';
+	}
+	try {
+		const origin = new URL(`http://${host}`).origin;
+		const url = new URL(target, origin);
+		return url.origin === origin ? `${url.pathname}${url.search}${url.hash}` : '/';
+	} catch {
+		return '/';
+	}
 }
 
 /**
@@ -111,7 +133,7 @@ export function create_middleware(name, nonce, get_status) {
 		const url = new URL(path, 'http://localhost');
 		if (url.pathname === USE_LOCALHOST_PATH) {
 			response.writeHead(302, {
-				location: safe_path(url.searchParams.get('to')),
+				location: safe_destination(url.searchParams.get('to'), request.headers.host),
 				'set-cookie': `${cookie}=1; Path=/; HttpOnly; SameSite=Lax`,
 				'cache-control': 'no-store'
 			});
@@ -174,13 +196,29 @@ export function create_plugin(options, deps) {
 		configureServer(server) {
 			// Vitest also runs Vite in serve mode; tests must not start containers or change setup.
 			if (deps.env.VITEST) return;
-			// Syntax Auth's own dev server takes the container's place (scripts/local_server.js).
-			if (name !== 'auth') {
+			// Without a name, exactly as before: keep local Syntax Auth running.
+			if (!name) {
 				deps
 					.ensure_syntax_auth()
 					.catch((error) => console.error('Syntax Auth local startup failed', error));
+				return;
 			}
-			if (!name) return;
+			// Syntax Auth's own dev server takes the container's place (scripts/local_server.js).
+			// A site's dev server starts Docker and the container only on a Mac with a person at its
+			// screen; on Linux, Windows, over SSH, or in CI it only checks, like the rest of setup.
+			if (name !== 'auth') {
+				void (async () => {
+					try {
+						const can_start =
+							deps.platform === 'darwin' && (await has_desktop(with_command_timeouts(deps)));
+						await deps.ensure_syntax_auth({ can_start });
+					} catch (error) {
+						deps.warn(
+							`Local Syntax Auth wasn't checked: ${error instanceof Error ? error.message : String(error)}. Restart dev to try again.`
+						);
+					}
+				})();
+			}
 
 			const nonce = randomUUID();
 			/** @type {SiteStatus} */

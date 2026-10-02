@@ -1,6 +1,7 @@
 import { redirect } from '@sveltejs/kit';
 
 import { LOCAL_DEVELOPER } from '$lib/server/local_developer';
+import { is_syntax_test_app_url } from '$lib/utils/local_hosts';
 import { is_loopback_hostname } from '$lib/utils/loopback';
 
 import type { PageServerLoad } from './$types';
@@ -30,6 +31,10 @@ function get_safe_return_to(value: string | null, is_local_development: boolean)
 		return_url.protocol === 'http:' &&
 		is_loopback_hostname(return_url.hostname)
 	) {
+		return return_url.href;
+	}
+
+	if (is_local_development && is_syntax_test_app_url(return_url)) {
 		return return_url.href;
 	}
 

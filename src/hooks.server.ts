@@ -1,7 +1,7 @@
 import { building } from '$app/environment';
 import { create_auth } from '$lib/server/auth';
-import { get_auth_environment } from '$lib/server/env';
-import { is_loopback_hostname } from '$lib/utils/loopback';
+import { for_local_site, get_auth_environment } from '$lib/server/env';
+import { get_local_site, local_host_refusal } from '$lib/utils/local_hosts';
 import { svelteKitHandler } from 'better-auth/svelte-kit';
 
 import type { Handle } from '@sveltejs/kit';
@@ -15,11 +15,29 @@ export const handle: Handle = async ({ event, resolve }) => {
 		return resolve(event);
 	}
 
-	const environment = get_auth_environment(event.platform?.env);
+	let environment = get_auth_environment(event.platform?.env);
 
-	// Local mode has a passwordless developer account, so it must never answer a real hostname.
-	if (environment.is_local_development && !is_loopback_hostname(event.url.hostname)) {
-		return new Response('Local Syntax Auth only serves localhost', { status: 403 });
+	if (environment.is_local_development) {
+		const site = get_local_site(event.url.hostname, event.request.headers.get('cookie'));
+
+		// Local mode has a passwordless developer account, so it must never answer a real hostname.
+		if (!site) {
+			const loopback_origin = new URL(environment.BETTER_AUTH_URL).origin;
+			return new Response(local_host_refusal(event.url.hostname, loopback_origin), {
+				status: 403,
+				headers: { 'content-type': 'text/plain; charset=utf-8' }
+			});
+		}
+
+		environment = for_local_site(environment, site);
+
+		// Behind the local HTTPS proxy, and on app servers' calls through localhost, the request's
+		// origin differs from https://auth.syntax.test, so svelteKitHandler wouldn't recognize these
+		// paths. Better Auth handles them before the getSession below, which would otherwise refresh
+		// the session first and keep get-session's refreshed cookie from reaching the app.
+		if (site === 'syntax_test' && event.url.pathname.startsWith('/api/auth/')) {
+			return create_auth(environment).handler(event.request);
+		}
 	}
 
 	const auth = create_auth(environment);

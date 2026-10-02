@@ -1,6 +1,11 @@
 import type { D1Database } from '@cloudflare/workers-types';
 
 // Relative so scripts/register_oauth_client.ts can load this module outside SvelteKit.
+import {
+	SYNTAX_TEST_AUTH_URL,
+	SYNTAX_TEST_COOKIE_DOMAIN,
+	type LocalSite
+} from '../utils/local_hosts';
 import { is_loopback_hostname } from '../utils/loopback';
 
 // Only used when Syntax Auth runs on a loopback URL, where sessions never leave the machine.
@@ -13,7 +18,7 @@ interface SharedAuthEnvironment {
 	BETTER_AUTH_SECRET: string;
 }
 
-interface LocalAuthEnvironment extends SharedAuthEnvironment {
+export interface LocalAuthEnvironment extends SharedAuthEnvironment {
 	is_local_development: true;
 }
 
@@ -68,5 +73,19 @@ export function get_auth_environment(env: App.Platform['env'] | undefined): Auth
 		BETTER_AUTH_SECRET: require_string(env, 'BETTER_AUTH_SECRET'),
 		GITHUB_CLIENT_ID: require_string(env, 'GITHUB_CLIENT_ID'),
 		GITHUB_CLIENT_SECRET: require_string(env, 'GITHUB_CLIENT_SECRET')
+	};
+}
+
+// Local mode answers both localhost and auth.syntax.test, so it configures Better Auth per request.
+export function for_local_site(
+	environment: LocalAuthEnvironment,
+	site: LocalSite
+): LocalAuthEnvironment {
+	if (site === 'loopback') return environment;
+
+	return {
+		...environment,
+		BETTER_AUTH_URL: SYNTAX_TEST_AUTH_URL,
+		AUTH_COOKIE_DOMAIN: SYNTAX_TEST_COOKIE_DOMAIN
 	};
 }

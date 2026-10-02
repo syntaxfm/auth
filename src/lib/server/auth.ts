@@ -4,6 +4,7 @@ import { betterAuth } from 'better-auth';
 import { jwt } from 'better-auth/plugins';
 import { drizzle } from 'drizzle-orm/d1';
 
+import { SYNTAX_TEST_TRUSTED_ORIGINS } from '../utils/local_hosts';
 import * as schema from './db/schema';
 import type { AuthEnvironment } from './env';
 import { LOCAL_DEVELOPER } from './local_developer';
@@ -23,10 +24,19 @@ export function create_auth(env: AuthEnvironment) {
 		}),
 		disabledPaths: ['/token'],
 		trustedOrigins: env.is_local_development
-			? [better_auth_origin, 'http://localhost:*', 'http://127.0.0.1:*']
+			? [
+					better_auth_origin,
+					'http://localhost:*',
+					'http://127.0.0.1:*',
+					...SYNTAX_TEST_TRUSTED_ORIGINS
+				]
 			: ['https://syntax.fm', 'https://*.syntax.fm', better_auth_origin],
 		advanced: env.AUTH_COOKIE_DOMAIN
 			? {
+					// Locally the .syntax.test cookie must keep its `__Secure-` name and `Secure` attribute
+					// when app servers call over http://localhost, because Better Auth reads only the
+					// configured name. Deployed URLs are https, so they get both without this.
+					...(env.is_local_development ? { useSecureCookies: true } : {}),
 					crossSubDomainCookies: {
 						enabled: true,
 						domain: env.AUTH_COOKIE_DOMAIN

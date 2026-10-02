@@ -130,7 +130,8 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    `https://auth.syntax.fm` fixed in code for production builds, so no environment setting can
    point production elsewhere. Use the origin for `get-session`, `sign-in`, and `sign-out`. Accept
    `http://localhost` and `http://127.0.0.1` `return_to` and sign-out origins only in development
-   builds.
+   builds, plus `https://syntax.test` and `https://*.syntax.test` for apps on the local HTTPS names
+   below.
 3. The app may run on any port. Local Syntax Auth accepts any `http://localhost` or
    `http://127.0.0.1` port for `return_to`, sign-in, and sign-out.
 4. Sign in with **Continue as Local Developer**. That account always has the central user ID
@@ -139,9 +140,32 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    Production never issues this ID.
 
 Local mode turns on only when Syntax Auth runs on a loopback URL without a shared cookie domain. In
-that mode it serves only `localhost` requests, uses its own local D1 state and a development-only
-signing secret, and replaces GitHub with the local developer account. Its sessions are meaningless
-to production. The container publishes its port on `127.0.0.1` only.
+that mode it answers only `localhost` and `auth.syntax.test`, uses its own local D1 state and a
+development-only signing secret, and replaces GitHub with the local developer account. Any other
+host gets a 403 that names the host and the two addresses to use instead. Its sessions are
+meaningless to production. The container publishes its port on `127.0.0.1` only.
+
+### Local HTTPS names
+
+Syntax apps can also run locally on three HTTPS names, served by a local HTTPS proxy:
+`https://syntax.test` (the website), `https://lab.syntax.test` (Lab), and `https://auth.syntax.test`
+(local Syntax Auth). On those names, as in production, one cookie on the parent domain
+(`.syntax.test`) signs a browser in to every app:
+
+- Send browsers to `https://auth.syntax.test`, for example
+  `https://auth.syntax.test/sign-in?return_to=<encoded app URL>`. Local Syntax Auth accepts
+  `return_to` URLs on `https://syntax.test` and `https://*.syntax.test` without credentials, and
+  drops `http` URLs and look-alike hosts such as `lab.syntax.test.example.com`.
+- Keep the app server's calls on `http://localhost:37960`: `get-session` with the browser's
+  `Cookie` header unchanged, and `POST /api/auth/sign-out` with that header and the app's own
+  HTTPS origin (such as `https://lab.syntax.test`) as `Origin`. Forward every returned `Set-Cookie`
+  header to the browser unchanged.
+- Signing in at `https://auth.syntax.test` sets `__Secure-better-auth.session_token` with
+  `Domain=.syntax.test; Path=/; Secure; HttpOnly; SameSite=Lax`. When an app server forwards that
+  cookie to `http://localhost:37960`, local Syntax Auth reads it, refreshes it, and deletes it with
+  the same name and attributes.
+- Apps still on `http://localhost` keep working unchanged, with their own host-only sessions. A
+  browser signed in on one set of names is signed out on the other.
 
 ## External domains
 

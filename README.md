@@ -96,7 +96,11 @@ started and start the container again, so other Syntax apps keep signing in. Nei
 secrets: the Cloudflare adapter reads the committed `local` Wrangler environment, which has a
 loopback URL, no shared cookie domain, and a local-only D1 database under the ignored `.wrangler/`
 directory. In that mode Syntax Auth replaces GitHub with a one-click local developer account (user
-ID `local-developer`), trusts only `localhost` origins, and refuses requests for any other host.
+ID `local-developer`) and answers only `localhost` and `auth.syntax.test`, the local HTTPS name
+that apps on `https://syntax.test` and `https://*.syntax.test` send browsers to. On
+`auth.syntax.test`, and on app servers' `localhost` calls that forward its cookie, sessions use the
+shared `.syntax.test` cookie described in `CONSUMING_AUTH.md`. Any other host gets a 403 naming
+the host.
 Deploys use the top-level configuration and never enable local mode.
 
 Consumer apps run the same service from the private `ghcr.io/syntaxfm/auth-local` Docker image,
@@ -112,12 +116,17 @@ Useful commands:
 ```sh
 pnpm check
 pnpm lint
+pnpm test
 pnpm build
 pnpm preview
 pnpm cf-typegen
 pnpm db:generate
 pnpm d1:migration:create <migration-name>
 ```
+
+`pnpm test` runs the unit tests and an integration test that builds the app, serves it with
+`vite preview` on a free port with a temporary D1, and signs in on `localhost` and
+`auth.syntax.test`. It never touches port 37960, the container, or `.wrangler/state`.
 
 `drizzle.config.ts` is intentionally generation-only: it declares the SQLite schema and migrations
 directory without inventing a local SQLite URL or storing Cloudflare credentials. Apply migrations

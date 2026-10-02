@@ -9,6 +9,7 @@
 		"preview": "node scripts/local_server.js preview",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"lint": "prettier --check . && eslint .",
+		"test": "tsx --test 'src/**/*.test.ts'",
 		"format": "prettier --write .",
 		"cf-typegen": "wrangler types",
 		"db:generate": "drizzle-kit generate",

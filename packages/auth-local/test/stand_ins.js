@@ -520,6 +520,14 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 		free_port()
 	]);
 
+	/** How this Mac opens the Docker app: quickly, and keeping its outcome in the temporary folder. */
+	const docker_start = {
+		platform: /** @type {NodeJS.Platform} */ ('darwin'),
+		result_path: join(directory, 'docker-start.json'),
+		ready_timeout_ms: 1_000,
+		poll_ms: 10
+	};
+
 	if (caddy) {
 		state.listeners.set(caddy.admin_port, [{ address: '127.0.0.1', process: 'caddy', pid: 610 }]);
 		state.processes.set(610, '/opt/homebrew/bin/caddy');
@@ -540,7 +548,11 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 		lookup: hosts_lookup(hosts_path),
 		setup_lock: (task) => with_port_lock(setup_lock_port, task),
 		container_lock: (task) => with_port_lock(container_lock_port, task),
-		ensure_docker,
+		ensure_docker: (run_command) =>
+			ensure_docker(run_command, {
+				...docker_start,
+				lock: (task) => with_port_lock(container_lock_port, task)
+			}),
 		log: (message) => logs.push(message),
 		warn: (message) => logs.push(message),
 		recheck_ms: 50,
@@ -574,6 +586,7 @@ export async function create_mac({ hosts = SYSTEM_HOSTS, caddy: caddy_options = 
 
 	return {
 		deps,
+		docker_start,
 		run,
 		calls,
 		call_options,

@@ -1,10 +1,14 @@
 // Local Syntax Auth's own startup (ensure_syntax_auth): a command that stalls ends the start with a
-// message naming it and its fix, for each class of limit.
+// message naming it and its fix, for each class of limit, and the Docker app opens once at a time.
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { run as real_run, stall_message } from '../container.js';
+import { run as real_run, stall_message, with_port_lock } from '../container.js';
 import { ensure_syntax_auth } from '../index.js';
+import { free_port } from './stand_ins.js';
 
 /** @param {string} stdout */
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
@@ -119,3 +123,105 @@ test(
 		});
 	}
 );
+
+/**
+ * Docker on a Mac where the engine isn't running: `open -a Docker` opens the app, which answers
+ * `docker info` after `ready_ms` (never, when null). Syntax Auth's image is there and its container
+ * starts on `docker run`.
+ * @param {number | null} ready_ms
+ */
+function sleeping_docker(ready_ms) {
+	/** @type {string[]} */
+	const calls = [];
+	/** @type {number | null} */
+	let opened_at = null;
+	let started = false;
+	const is_ready = () =>
+		opened_at !== null && ready_ms !== null && Date.now() - opened_at >= ready_ms;
+	/** @type {import('../container.js').Run} */
+	const run = async (command, args) => {
+		calls.push(`${command} ${args.join(' ')}`);
+		if (command === 'open') {
+			opened_at ??= Date.now();
+			return ok();
+		}
+		if (args[0] === 'info')
+			return is_ready() ? ok('29.5.3') : fail('Cannot connect to the Docker daemon');
+		if (args[0] === 'context') return ok('unix:///Users/test/.docker/run/docker.sock');
+		if (args[0] === 'image') return ok();
+		if (args[0] === 'container') return fail('Error: No such container: syntax-auth');
+		if (args[0] === 'run') {
+			started = true;
+			return ok('container-id');
+		}
+		return fail(`unexpected ${command} ${args[0]}`);
+	};
+	return {
+		run,
+		calls,
+		opens: () => calls.filter((call) => call.startsWith('open ')),
+		is_started: () => started
+	};
+}
+
+/** @param {ReturnType<typeof sleeping_docker>} docker @param {string} directory @param {number} lock_port */
+function start_on(docker, directory, lock_port) {
+	return start(docker.run, {
+		is_healthy: async () => docker.is_started(),
+		container_lock: (task) => with_port_lock(lock_port, task),
+		docker_start: {
+			platform: 'darwin',
+			result_path: join(directory, 'docker-start.json'),
+			ready_timeout_ms: 300,
+			poll_ms: 10
+		}
+	});
+}
+
+test('two dev servers starting at once open Docker once, and both start', async () => {
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		const docker = sleeping_docker(100);
+		const lock_port = await free_port();
+		const both = await Promise.all([
+			start_on(docker, directory, lock_port),
+			start_on(docker, directory, lock_port)
+		]);
+		assert.deepEqual(both, [
+			{ warnings: [], updaters: 1 },
+			{ warnings: [], updaters: 1 }
+		]);
+		assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+		assert.equal(docker.calls.filter((call) => call.startsWith('docker run')).length, 1);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a dev server that waited for another's Docker start gets that start's failure, and never opens Docker again", async () => {
+	const directory = await mkdtemp(join(tmpdir(), 'syntax-auth-docker-'));
+	try {
+		const docker = sleeping_docker(null);
+		const lock_port = await free_port();
+		const message =
+			"Running signed out: Docker Desktop was opened, but Docker wasn't ready after 300 ms. Check Docker Desktop for an error or a prompt, then restart dev.";
+		const both = await Promise.all([
+			start_on(docker, directory, lock_port),
+			start_on(docker, directory, lock_port)
+		]);
+		assert.deepEqual(both, [
+			{ warnings: [message], updaters: 0 },
+			{ warnings: [message], updaters: 0 }
+		]);
+		assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+
+		// A start after both ended is a retry: it opens Docker itself.
+		assert.deepEqual(await start_on(docker, directory, lock_port), {
+			warnings: [message],
+			updaters: 0
+		});
+		assert.equal(docker.opens().length, 2);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});

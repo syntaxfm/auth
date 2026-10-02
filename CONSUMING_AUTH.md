@@ -111,7 +111,10 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    Every dev server start then makes sure the one shared `syntax-auth` container is running,
    whether or not any other Syntax app is already running, without delaying the dev server. Any number of
    apps may start at once: container changes are serialized by a machine-wide lock that the OS
-   releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
+   releases even if a process crashes. It opens Docker Desktop (or OrbStack) on macOS when needed,
+   under the same lock, so the app is opened only once at a time: a second app starting meanwhile
+   waits for that start and, if it failed, prints the same message instead of opening it again. It
+   pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
    volume, and skips Vitest. If Docker is missing or stopped, the image is not accessible, or
    another program holds the port, it prints one warning naming the exact problem and its fix, and
@@ -205,14 +208,33 @@ Then the dev server prints `https://<name> is ready.`, and page loads on `localh
 step fails, the dev server prints the step, what failed, and its fix, keeps running on `localhost`,
 and answers page loads there with a page naming the same, with a link to keep that browser on
 `localhost` for now. A retry (restart dev) is always safe, and a command that stalls is stopped
-with a message naming it. Where nobody can answer a dialog (over SSH, or with `CI` set), setup
-changes nothing and prints each fix, such as running
+with a message naming it.
+
+Setup shows its password and approval dialogs only when a person is likely at the Mac's screen.
+It shows none, changes nothing, and prints each fix when dev (or `syntax-auth-local setup`)
+starts:
+
+- from an AI coding agent's shell (`CLAUDECODE` or `PI_CODING_AGENT` set), so an agent checking
+  a page never makes a dialog appear in front of you;
+- over SSH (`SSH_CONNECTION` or `SSH_TTY` set), in CI (`CI` set), or under a test runner
+  (`NODE_TEST_CONTEXT` or `VITEST` set);
+- outside the Mac's desktop session (`launchctl managername` isn't `Aqua`).
+
+Its first line says which one, for example "Started from an agent shell (PI_CODING_AGENT), so
+setup didn't show any dialogs and changed nothing." Each fix after it is a command to run in
+Terminal at the Mac's own screen, such as
 `pnpm exec syntax-auth-local setup lab --port 1337 --route '/parties/*=1999'` (the dev server
-prints it with its own port and routes) in Terminal at the Mac's own screen; `setup lab` and
-`setup website` need `--port`. On Linux and Windows it changes nothing and says that automatic
-setup is macOS-only for now. In both cases a named dev server also leaves Docker and the local
-Syntax Auth container alone: if Syntax Auth isn't running, it says to start it with
-`pnpm exec syntax-auth-local`. The routes stay in Caddy when dev stops; Syntax Auth's `README.md`
+prints it with its own port and routes); `setup lab` and `setup website` need `--port`. When you
+are watching the screen and want an agent's run to show the dialogs, start it with
+`SYNTAX_DEV_SETUP_DIALOGS=allow`, for example `SYNTAX_DEV_SETUP_DIALOGS=allow pnpm dev`. That
+switch never works over SSH, in CI, or under a test runner. An agent's dev server still opens
+Docker and starts the local Syntax Auth container when needed, since neither shows one of
+setup's dialogs.
+
+On Linux and Windows setup changes nothing and says that automatic setup is macOS-only for now.
+There, and over SSH, in CI, under a test runner, or outside the desktop session, a named dev
+server also leaves Docker and the local Syntax Auth container alone: if Syntax Auth isn't
+running, it says to start it with `pnpm exec syntax-auth-local`. The routes stay in Caddy when dev stops; Syntax Auth's `README.md`
 shows how to undo every step.
 
 On those names:

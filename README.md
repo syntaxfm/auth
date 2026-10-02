@@ -123,9 +123,16 @@ On macOS, `pnpm dev` also makes `https://auth.syntax.test` answer, through the s
 (`syntax_auth({ name: 'auth' })` in `vite.config.ts`), as every Syntax app's dev server does for
 its own name. `CONSUMING_AUTH.md` describes each step; the first start asks for your password once
 (for `/etc/hosts`) and one approval (to trust Caddy's local root), and later starts ask nothing.
-Syntax Auth's own dev server never redirects `localhost`, because apps call it there. Where nobody
-can answer a dialog (over SSH, in CI), run `node packages/auth-local/bin.js setup auth` in Terminal
-at the Mac's own screen instead.
+Syntax Auth's own dev server never redirects `localhost`, because apps call it there.
+
+Setup never shows a dialog from an AI coding agent's shell (`CLAUDECODE` or `PI_CODING_AGENT`
+set), over SSH (`SSH_CONNECTION` or `SSH_TTY`), in CI (`CI`), under a test runner
+(`NODE_TEST_CONTEXT` or `VITEST`), or outside the Mac's desktop session. It then changes nothing,
+says why on its first line, and prints each fix, such as running
+`node packages/auth-local/bin.js setup auth` in Terminal at the Mac's own screen. To let an
+agent's run show the dialogs while you watch the screen, start it with
+`SYNTAX_DEV_SETUP_DIALOGS=allow` (for example `SYNTAX_DEV_SETUP_DIALOGS=allow pnpm dev`); the
+switch never works over SSH, in CI, or under a test runner.
 
 Setup leaves everything in place when dev stops. To undo it:
 
@@ -161,7 +168,10 @@ pnpm d1:migration:create <migration-name>
 `auth.syntax.test`, and the `packages/auth-local` tests (also `pnpm --dir packages/auth-local
 test`). Those run setup against stand-ins for Caddy, docker, the password dialog (the real hosts
 script edits a temporary file), and macOS's `security`. None of them touches port 37960, the
-container, `.wrangler/state`, `/etc/hosts`, the keychain, or ports 80, 443, and 2019.
+container, `.wrangler/state`, `/etc/hosts`, the keychain, or ports 80, 443, and 2019. Under a test
+runner, setup shows no dialog, and the package refuses to run `osascript`, `sudo`, `open`,
+`docker`, or a `security` command that changes the keychain, so a test that misses a stand-in
+fails instead of acting on your Mac.
 
 `drizzle.config.ts` is intentionally generation-only: it declares the SQLite schema and migrations
 directory without inventing a local SQLite URL or storing Cloudflare credentials. Apply migrations

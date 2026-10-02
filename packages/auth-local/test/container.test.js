@@ -1,8 +1,38 @@
-// Running commands with a time limit, and reading netstat's listeners.
+// Running commands with a time limit, refusing system commands under a test runner, and reading
+// netstat's listeners.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { find_port_listeners, run } from '../container.js';
+import { find_port_listeners, refused_under_tests, run } from '../container.js';
+
+test('under a test runner, a command that could show a dialog or change this computer never starts', async () => {
+	// This file runs under node --test, which sets NODE_TEST_CONTEXT. The paths don't exist, so
+	// even a broken guard could only fail to spawn them.
+	assert.ok(process.env.NODE_TEST_CONTEXT);
+	for (const [command, ...args] of [
+		['/nonexistent/osascript', '-e', 'do shell script "true" with administrator privileges'],
+		['/nonexistent/sudo', 'true'],
+		['/nonexistent/open', '--background', '-a', 'Docker'],
+		['/nonexistent/docker', 'run', 'caddy'],
+		['/nonexistent/security', 'add-trusted-cert', 'root.pem']
+	]) {
+		const result = await run(command, args);
+		assert.equal(result.code, null);
+		assert.match(
+			result.stderr,
+			/^`.+` was refused: tests \(NODE_TEST_CONTEXT is set\) must use a stand-in for it$/,
+			command
+		);
+	}
+
+	for (const env of [{ NODE_TEST_CONTEXT: 'child-v8' }, { VITEST: 'true' }]) {
+		assert.ok(refused_under_tests('security', ['delete-certificate', '-Z', 'abc'], env));
+		assert.equal(refused_under_tests('security', ['verify-cert', '-c', 'leaf.pem'], env), null);
+		assert.equal(refused_under_tests('security', ['find-certificate', '-a'], env), null);
+		assert.equal(refused_under_tests('/bin/sh', ['-c', 'true'], env), null);
+	}
+	assert.equal(refused_under_tests('osascript', ['-e', 'x'], {}), null);
+});
 
 test(
 	'a command that ignores SIGTERM is killed after a short grace, and the result names it',

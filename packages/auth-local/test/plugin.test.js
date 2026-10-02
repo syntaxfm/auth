@@ -314,6 +314,7 @@ function real_ensure(mac, healthy, run = mac.run) {
 			...options,
 			run,
 			container_lock: mac.deps.container_lock,
+			docker_start: mac.docker_start,
 			is_healthy: async () => {
 				auth.checks++;
 				return typeof healthy === 'function' ? healthy() : healthy;
@@ -417,6 +418,31 @@ test('over SSH, or with nobody at the screen, a site never starts Docker or the 
 			[]
 		);
 	}
+});
+
+test('from an agent shell, a dev start shows no dialog and says why first, yet still keeps local Syntax Auth running', async () => {
+	const mac = await create_mac();
+	cleanups.push(() => mac.close());
+	mac.deps.env = { PI_CODING_AGENT: 'true' };
+	const { port, auth } = await start_with_plugin(mac, { name: 'lab' });
+	const [first, second] = mac.logs[0].split('\n');
+	assert.equal(
+		first,
+		"Started from an agent shell (PI_CODING_AGENT), so setup didn't show any dialogs and changed nothing. A person at this Mac can run each fix below in their own Terminal, or restart dev with SYNTAX_DEV_SETUP_DIALOGS=allow while watching the screen."
+	);
+	assert.equal(
+		second,
+		`  https://lab.syntax.test isn't working yet, so keep using http://localhost:${port} for now.`
+	);
+	assert.deepEqual(
+		mac
+			.commands()
+			.filter((command) => /^(osascript|sudo) |^security add|^security delete/.test(command)),
+		[]
+	);
+	// Opening Docker and starting the container show none of setup's dialogs, so a site may still
+	// start them (the updater starts only when it may).
+	assert.deepEqual(auth, { checks: 1, updaters: 1, logs: [] });
 });
 
 test("without a name the plugin keeps today's behavior on any platform: it starts local Syntax Auth", async () => {

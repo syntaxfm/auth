@@ -1,7 +1,7 @@
 // Docker, process, and locking internals shared by the dev-server entry (index.js), the .syntax.test
 // setup (setup.js), and the detached updater.
 import { spawn } from 'node:child_process';
-import { access, constants, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { access, constants, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
@@ -64,6 +64,13 @@ export function stall_message(command, args, timeout_ms) {
 	return `\`${describe_command(command, args)}\` didn't finish within ${describe_limit(timeout_ms)}, so setup stopped it`;
 }
 
+/** @param {number} ms @returns {string} like "2 minutes", or as describe_limit gives it */
+function describe_wait(ms) {
+	if (ms < 60_000 || ms % 60_000 !== 0) return describe_limit(ms);
+	const minutes = ms / 60_000;
+	return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+}
+
 /** @param {number} timeout_ms @returns {string} like "30 seconds" or "150 ms" */
 function describe_limit(timeout_ms) {
 	const seconds = Math.round(timeout_ms / 1_000);
@@ -72,13 +79,39 @@ function describe_limit(timeout_ms) {
 		: `${timeout_ms} ms`;
 }
 
+// The read-only `security` subcommands; every other one can change the keychain or show a dialog.
+const READ_ONLY_SECURITY = new Set(['verify-cert', 'find-certificate']);
+
+/**
+ * Why `command` must not run under a test runner, or null. Tests use stand-ins for every command
+ * that can show a dialog or change this computer (the hosts dialog, the keychain, sudo, opening an
+ * app, docker), so a test that reaches the real one is a bug: it fails instead of acting.
+ * @param {string} command
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} env
+ */
+export function refused_under_tests(command, args, env) {
+	const runner = env.NODE_TEST_CONTEXT ? 'NODE_TEST_CONTEXT' : env.VITEST ? 'VITEST' : null;
+	if (!runner) return null;
+	const name = basename(command);
+	const is_refused =
+		['osascript', 'sudo', 'open', 'docker'].includes(name) ||
+		(name === 'security' && !READ_ONLY_SECURITY.has(args[0] ?? ''));
+	return is_refused
+		? `\`${describe_command(command, args)}\` was refused: tests (${runner} is set) must use a stand-in for it`
+		: null;
+}
+
 /**
  * Runs a command to completion. Never throws: a missing command gives code null and its error. A
  * command still running after `timeout_ms` gets SIGTERM, then SIGKILL after `kill_grace_ms`, and
- * gives `timed_out: true` with a stderr that names the command.
+ * gives `timed_out: true` with a stderr that names the command. Under a test runner, a command that
+ * could show a dialog or change this computer never starts (see refused_under_tests).
  * @type {Run}
  */
 export function run(command, args, { input, env, timeout_ms, kill_grace_ms = KILL_GRACE_MS } = {}) {
+	const refusal = refused_under_tests(command, args, process.env);
+	if (refusal) return Promise.resolve({ code: null, stdout: '', stderr: refusal });
 	return new Promise((resolve) => {
 		const child = spawn(command, args, {
 			env: env ?? process.env,
@@ -592,12 +625,47 @@ async function is_docker_running(run_command) {
 	}
 }
 
+/**
+ * How `ensure_docker` opens the Docker app on a Mac.
+ * @typedef {object} DockerStartOptions
+ * @property {<T>(task: () => Promise<T>) => Promise<T>} lock machine-wide; the container lock
+ * @property {NodeJS.Platform} platform
+ * @property {string} result_path where the last start's outcome is kept for those that waited
+ * @property {number} ready_timeout_ms how long the opened app may take to answer
+ * @property {number} poll_ms
+ */
+/** @type {DockerStartOptions} */
+export const DOCKER_START = {
+	lock: with_container_lock,
+	platform: process.platform,
+	result_path: join(tmpdir(), 'syntax-auth-docker-start.json'),
+	ready_timeout_ms: DOCKER_START_TIMEOUT_MS,
+	poll_ms: 1_000
+};
+
+/**
+ * The outcome of a start that finished after `since`, or null when there is none.
+ * @param {string} path
+ * @param {number} since
+ * @returns {Promise<{ problem: string | null } | null>}
+ */
+async function read_start_result(path, since) {
+	try {
+		const saved = JSON.parse(await readFile(path, 'utf8'));
+		if (typeof saved?.finished_at !== 'number' || saved.finished_at < since) return null;
+		return { problem: typeof saved.problem === 'string' ? saved.problem : null };
+	} catch {
+		return null;
+	}
+}
+
 // On macOS, opens the Docker app that Docker's current context points at, then waits for it.
 /**
  * @param {Run} run_command
+ * @param {DockerStartOptions} options
  * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
  */
-async function start_docker_app(run_command) {
+async function start_docker_app(run_command, { ready_timeout_ms, poll_ms }) {
 	const context = await run_command('docker', [
 		'context',
 		'inspect',
@@ -617,21 +685,50 @@ async function start_docker_app(run_command) {
 		if (opened.code !== 0) continue;
 
 		log(`Starting ${app}`);
-		const deadline = Date.now() + DOCKER_START_TIMEOUT_MS;
+		const deadline = Date.now() + ready_timeout_ms;
 		while (Date.now() < deadline) {
 			if (await is_docker_running(run_command)) return null;
-			await sleep(1_000);
+			await sleep(poll_ms);
 		}
-		return `${app} was opened, but Docker wasn't ready after 2 minutes. Check ${app} for an error or a prompt, then restart dev.`;
+		return `${app} was opened, but Docker wasn't ready after ${describe_wait(ready_timeout_ms)}. Check ${app} for an error or a prompt, then restart dev.`;
 	}
 	return 'Docker is installed but not running, and neither Docker Desktop nor OrbStack is installed to start it. Start your Docker engine, then restart dev.';
 }
 
 /**
- * @param {Run} [run_command]
+ * Opens the Docker app at most once at a time on this Mac: two app instances opening it together
+ * crash Docker Desktop. The start runs under the container lock; an instance that waited for it
+ * re-checks Docker, and when the start it waited for failed, gives that start's message instead of
+ * opening the app again.
+ * @param {Run} run_command
+ * @param {DockerStartOptions} options
  * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
  */
-export async function ensure_docker(run_command = run) {
+async function start_docker_app_once(run_command, options) {
+	const asked_at = Date.now();
+	return options.lock(async () => {
+		if (await is_docker_running(run_command)) return null;
+		const waited_for = await read_start_result(options.result_path, asked_at);
+		if (waited_for?.problem) return waited_for.problem;
+
+		const problem = await start_docker_app(run_command, options);
+		await writeFile(
+			options.result_path,
+			JSON.stringify({ finished_at: Date.now(), problem })
+		).catch(() => {
+			// Only those waiting read it; without it, the next one opens the app itself.
+		});
+		return problem;
+	});
+}
+
+/**
+ * @param {Run} [run_command]
+ * @param {Partial<DockerStartOptions>} [start_options] see DOCKER_START
+ * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
+ */
+export async function ensure_docker(run_command = run, start_options = {}) {
+	const options = { ...DOCKER_START, ...start_options };
 	const info = await run_command('docker', ['info', '--format', '{{.ServerVersion}}']);
 	if (info.code === 0) return null;
 	if (is_missing_command(info)) {
@@ -640,6 +737,6 @@ export async function ensure_docker(run_command = run) {
 	if (/permission denied/i.test(info.stderr)) {
 		return `Docker is installed, but your user can't use it (${first_line(info.stderr)}). On Linux, add yourself to the docker group (https://docs.docker.com/engine/install/linux-postinstall/), then restart dev.`;
 	}
-	if (process.platform === 'darwin') return start_docker_app(run_command);
+	if (options.platform === 'darwin') return start_docker_app_once(run_command, options);
 	return `Docker is installed but not running (${first_line(info.stderr)}). Start it (for example \`sudo systemctl start docker\`), then restart dev.`;
 }

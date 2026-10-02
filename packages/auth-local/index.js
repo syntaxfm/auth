@@ -39,8 +39,9 @@ const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
  * @property {() => Promise<boolean>} [is_healthy]
  * @property {() => void} [start_updater]
  * @property {(message: string) => void} [warn]
- * @property {<T>(task: () => Promise<T>) => Promise<T>} [container_lock]
+ * @property {<T>(task: () => Promise<T>) => Promise<T>} [container_lock] also serializes opening the Docker app
  * @property {Partial<import('./container.js').StartupLimits>} [limits] see STARTUP_LIMITS
+ * @property {Partial<Omit<import('./container.js').DockerStartOptions, 'lock'>>} [docker_start] see DOCKER_START
  */
 
 // Downloads the image outside the lock, so a slow first download never makes other apps time out
@@ -139,7 +140,8 @@ export async function ensure_syntax_auth({
 	start_updater: updater = start_updater,
 	warn: report = warn,
 	container_lock = with_container_lock,
-	limits = {}
+	limits = {},
+	docker_start = {}
 } = {}) {
 	const run_command = with_startup_limits(unbounded_run, { ...STARTUP_LIMITS, ...limits });
 	try {
@@ -151,7 +153,7 @@ export async function ensure_syntax_auth({
 				return;
 			}
 			const problem =
-				(await ensure_docker(run_command)) ??
+				(await ensure_docker(run_command, { ...docker_start, lock: container_lock })) ??
 				(await ensure_image(run_command)) ??
 				(await start_and_wait(run_command, check, container_lock));
 			if (problem) {

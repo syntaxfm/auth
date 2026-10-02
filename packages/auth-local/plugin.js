@@ -204,8 +204,9 @@ export function create_plugin(options, deps) {
 				return;
 			}
 			// Syntax Auth's own dev server takes the container's place (scripts/local_server.js).
-			// A site's dev server starts Docker and the container only on a Mac with a person at its
-			// screen; on Linux, Windows, over SSH, or in CI it only checks, like the rest of setup.
+			// A site's dev server starts Docker and the container only in the Mac's desktop session (an
+			// agent shell's too: neither shows one of setup's dialogs); on Linux, Windows, over SSH, in
+			// CI, or under a test runner it only checks, like the rest of setup.
 			if (name !== 'auth') {
 				void (async () => {
 					try {

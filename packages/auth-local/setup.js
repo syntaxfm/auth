@@ -38,7 +38,8 @@ export const STEPS = {
  * @typedef {{ step: string, problem: string, fix: string }} StepProblem
  * @typedef {{ name: SiteName, port?: number, routes?: { path: string, port: number }[], nonce?: string, probe_path?: string }} SetupOptions
  * @typedef {{ sites: Site[], caddy: Caddy, root_pem: string, can_change: boolean }} SetupContext
- * @typedef {{ state: 'worked', problems: [], context: SetupContext } | { state: 'failed', problems: StepProblem[] } | { state: 'unsupported', problems: [] }} SetupResult
+ * @typedef {{ state: 'worked', problems: [], context: SetupContext } | { state: 'failed', problems: StepProblem[], notice?: string } | { state: 'unsupported', problems: [] }} SetupResult
+ * @typedef {{ has_desktop: boolean, can_ask: true, notice: null } | { has_desktop: boolean, can_ask: false, notice: string }} Presence
  * @typedef {object} SetupDeps
  * @property {import('./container.js').Run} run
  * @property {NodeJS.Platform} platform
@@ -131,14 +132,63 @@ export function with_command_timeouts(deps) {
 	};
 }
 
+/** Set to `allow` to let setup show its dialogs from an agent shell while a person watches. */
+export const DIALOGS_SWITCH = 'SYNTAX_DEV_SETUP_DIALOGS';
+
+/** The variables that mark a shell an AI coding agent started. */
+const AGENT_VARIABLES = ['CLAUDECODE', 'PI_CODING_AGENT'];
+
 /**
- * Whether a person at this Mac's own screen can answer a password or approval dialog.
+ * Whether this run is at the Mac's own desktop session (`has_desktop`), and whether setup may show
+ * a password or approval dialog there (`can_ask`). Under a test runner, over SSH, in CI, or outside
+ * the desktop session, nobody can answer one. From an agent shell nobody is known to be watching,
+ * so setup shows none unless `SYNTAX_DEV_SETUP_DIALOGS=allow` says a person is; the switch never
+ * works under a test runner, over SSH, or in CI. When setup can't ask, `notice` says why, as the
+ * first line it prints.
+ * @param {{ run: import('./container.js').Run, env: NodeJS.ProcessEnv }} deps
+ * @returns {Promise<Presence>}
+ */
+export async function check_presence({ run, env }) {
+	const is_allowed = env[DIALOGS_SWITCH] === 'allow';
+	const refused = is_allowed
+		? ` ${DIALOGS_SWITCH}=allow works only at this Mac's own screen, never under a test runner, over SSH, or in CI.`
+		: '';
+	/** @param {string} where @returns {Presence} */
+	const away = (where) => ({
+		has_desktop: false,
+		can_ask: false,
+		notice: `Started ${where}, so setup didn't show any dialogs and changed nothing.${refused}`
+	});
+	if (env.NODE_TEST_CONTEXT) return away('under a test runner (NODE_TEST_CONTEXT is set)');
+	if (env.VITEST) return away('under a test runner (VITEST is set)');
+	if (env.CI) return away('in CI (CI is set)');
+	if (env.SSH_CONNECTION) return away('over SSH (SSH_CONNECTION is set)');
+	if (env.SSH_TTY) return away('over SSH (SSH_TTY is set)');
+	const manager = await run('launchctl', ['managername']);
+	const session = manager.code === 0 ? manager.stdout.trim() : '';
+	if (session !== 'Aqua') {
+		return away(
+			`outside this Mac's desktop session (\`launchctl managername\` says ${session || 'nothing'}, not Aqua)`
+		);
+	}
+	const agent = AGENT_VARIABLES.find((variable) => env[variable]);
+	if (agent && !is_allowed) {
+		return {
+			has_desktop: true,
+			can_ask: false,
+			notice: `Started from an agent shell (${agent}), so setup didn't show any dialogs and changed nothing. A person at this Mac can run each fix below in their own Terminal, or restart dev with ${DIALOGS_SWITCH}=allow while watching the screen.`
+		};
+	}
+	return { has_desktop: true, can_ask: true, notice: null };
+}
+
+/**
+ * Whether this run is at the Mac's own desktop session, where a site's dev server may open Docker
+ * and start the container (no dialog of setup's own). True in an agent shell too.
  * @param {{ run: import('./container.js').Run, env: NodeJS.ProcessEnv }} deps
  */
 export async function has_desktop(deps) {
-	if (deps.env.SSH_CONNECTION || deps.env.CI) return false;
-	const result = await deps.run('launchctl', ['managername']);
-	return result.code === 0 && result.stdout.trim() === 'Aqua';
+	return (await check_presence(deps)).has_desktop;
 }
 
 /**
@@ -155,6 +205,18 @@ function get_sites({ name, port, routes = [] }) {
 /** @param {StepProblem[]} problems @returns {SetupResult} */
 function failed(problems) {
 	return { state: 'failed', problems };
+}
+
+/**
+ * The result, with why setup showed no dialogs when it failed without asking.
+ * @param {SetupResult} result
+ * @param {Presence} presence
+ * @returns {SetupResult}
+ */
+function with_notice(result, presence) {
+	return result.state === 'failed' && presence.notice
+		? { ...result, notice: presence.notice }
+		: result;
 }
 
 /**
@@ -340,9 +402,12 @@ export async function run_setup(options, deps) {
 	if (deps.platform !== 'darwin') return { state: 'unsupported', problems: [] };
 	try {
 		const step_deps = { ...with_command_timeouts(deps), setup_command: setup_command(options) };
-		const can_ask = await has_desktop(step_deps);
+		const presence = await check_presence(step_deps);
 		const sites = get_sites(options);
-		return await deps.setup_lock(() => run_steps(options, sites, can_ask, step_deps));
+		const result = await deps.setup_lock(() =>
+			run_steps(options, sites, presence.can_ask, step_deps)
+		);
+		return with_notice(result, presence);
 	} catch (error) {
 		return failed([unexpected(error)]);
 	}
@@ -450,6 +515,7 @@ export function describe_result(options, result, port) {
 	}
 	if (result.state === 'worked') return [`${url} is ready.`];
 	return [
+		...(result.notice ? [result.notice] : []),
 		`${url} isn't working yet, so keep using ${localhost} for now.`,
 		...result.problems.map(
 			(problem) => `${problem.step}: ${problem.problem}${problem.fix ? ` Fix: ${problem.fix}` : ''}`

@@ -443,6 +443,155 @@ test('without a desktop session nothing changes, and every missing step prints i
 	);
 });
 
+/**
+ * The commands that show a dialog or change this computer: the hosts password dialog, sudo, the
+ * keychain, opening an app, and starting, downloading, or removing a container.
+ * @param {Awaited<ReturnType<typeof create_mac>>} mac
+ */
+function privileged_commands(mac) {
+	return mac
+		.commands()
+		.filter((command) =>
+			/^(osascript|sudo|open) |^security (?!verify-cert|find-certificate)|^docker (run|start|pull|rm)/.test(
+				command
+			)
+		);
+}
+
+/**
+ * A stand-in Mac where setup already worked once, and then macOS stopped trusting Caddy's root,
+ * so setup's next run reaches every step, the keychain approval included.
+ */
+async function mac_missing_trust() {
+	const mac = await create_mac();
+	cleanups.push(() => mac.close());
+	const dev = await start_dev_server();
+	assert.equal((await setup_lab(mac, dev)).state, 'worked');
+	mac.state.keychain.trusted.clear();
+	mac.calls.length = 0;
+	mac.caddy?.writes.splice(0);
+	return { mac, dev };
+}
+
+const NO_DIALOG_SCENES = [
+	{
+		env: { CLAUDECODE: '1' },
+		notice: `Started from an agent shell (CLAUDECODE), so setup didn't show any dialogs and changed nothing. A person at this Mac can run each fix below in their own Terminal, or restart dev with SYNTAX_DEV_SETUP_DIALOGS=allow while watching the screen.`
+	},
+	{
+		env: { PI_CODING_AGENT: 'true' },
+		notice: `Started from an agent shell (PI_CODING_AGENT), so setup didn't show any dialogs and changed nothing. A person at this Mac can run each fix below in their own Terminal, or restart dev with SYNTAX_DEV_SETUP_DIALOGS=allow while watching the screen.`
+	},
+	{
+		env: { PI_CODING_AGENT: 'true', SYNTAX_DEV_SETUP_DIALOGS: 'yes' },
+		notice: /^Started from an agent shell \(PI_CODING_AGENT\)/
+	},
+	{
+		env: { CI: 'true' },
+		notice: "Started in CI (CI is set), so setup didn't show any dialogs and changed nothing."
+	},
+	{
+		env: { SSH_CONNECTION: '100.64.0.2 50000 100.64.0.1 22' },
+		notice:
+			"Started over SSH (SSH_CONNECTION is set), so setup didn't show any dialogs and changed nothing."
+	},
+	{
+		env: { SSH_TTY: '/dev/ttys004' },
+		notice:
+			"Started over SSH (SSH_TTY is set), so setup didn't show any dialogs and changed nothing."
+	},
+	{
+		env: { NODE_TEST_CONTEXT: 'child-v8' },
+		notice:
+			"Started under a test runner (NODE_TEST_CONTEXT is set), so setup didn't show any dialogs and changed nothing."
+	},
+	{
+		env: { VITEST: 'true' },
+		notice:
+			"Started under a test runner (VITEST is set), so setup didn't show any dialogs and changed nothing."
+	},
+	{
+		env: {},
+		desktop: 'Background',
+		notice:
+			"Started outside this Mac's desktop session (`launchctl managername` says Background, not Aqua), so setup didn't show any dialogs and changed nothing."
+	}
+];
+
+test('an agent shell, CI, SSH, a test runner, or no desktop session: no dialog, nothing changes, and the first line says why', async () => {
+	for (const scene of NO_DIALOG_SCENES) {
+		const label = JSON.stringify(scene.env);
+		// Every step missing: the hosts file, Caddy (none runs), and trust.
+		const bare = await create_mac({ caddy: false });
+		cleanups.push(() => bare.close());
+		bare.deps.env = scene.env;
+		bare.state.desktop = scene.desktop ?? 'Aqua';
+		const result = await setup_lab(bare, await start_dev_server());
+		assert.equal(result.state, 'failed', label);
+		assert.deepEqual(
+			result.problems.map((problem) => problem.step),
+			['Hosts file', 'HTTPS proxy (Caddy)'],
+			label
+		);
+		const [first, second] = describe_result({ name: 'lab' }, result, 1337);
+		if (typeof scene.notice === 'string') assert.equal(first, scene.notice, label);
+		else assert.match(first, scene.notice, label);
+		assert.equal(
+			second,
+			"https://lab.syntax.test isn't working yet, so keep using http://localhost:1337 for now."
+		);
+		assert.equal(await bare.read_hosts(), SYSTEM_HOSTS, label);
+		assert.deepEqual(privileged_commands(bare), [], label);
+
+		// Only the keychain approval missing: it isn't asked for either.
+		const { mac, dev } = await mac_missing_trust();
+		mac.deps.env = scene.env;
+		mac.state.desktop = scene.desktop ?? 'Aqua';
+		const trust = await setup_lab(mac, dev);
+		assert.deepEqual(
+			trust.problems.map((problem) => problem.step),
+			['Certificate trust'],
+			label
+		);
+		assert.ok('notice' in trust && trust.notice, label);
+		assert.deepEqual(privileged_commands(mac), [], label);
+		assert.deepEqual(mac.caddy?.writes, [], label);
+	}
+});
+
+test('SYNTAX_DEV_SETUP_DIALOGS=allow lets an agent shell show the dialogs for a supervised run', async () => {
+	for (const agent of [{ CLAUDECODE: '1' }, { PI_CODING_AGENT: 'true' }]) {
+		const { mac, dev } = await mac_missing_trust();
+		mac.deps.env = { ...agent, SYNTAX_DEV_SETUP_DIALOGS: 'allow' };
+		const result = await setup_lab(mac, dev);
+		assert.equal(result.state, 'worked', JSON.stringify(result.problems));
+		assert.deepEqual(privileged_commands(mac), ['security add-trusted-cert']);
+	}
+});
+
+test('SYNTAX_DEV_SETUP_DIALOGS=allow is refused over SSH, in CI, under a test runner, and outside the desktop session', async () => {
+	const refused =
+		"SYNTAX_DEV_SETUP_DIALOGS=allow works only at this Mac's own screen, never under a test runner, over SSH, or in CI.";
+	for (const scene of [
+		{ env: { SSH_CONNECTION: '100.64.0.2 50000 100.64.0.1 22' }, why: 'over SSH (SSH_CONNECTION' },
+		{ env: { SSH_TTY: '/dev/ttys004', PI_CODING_AGENT: 'true' }, why: 'over SSH (SSH_TTY' },
+		{ env: { CI: '1', CLAUDECODE: '1' }, why: 'in CI (CI' },
+		{ env: { NODE_TEST_CONTEXT: 'child-v8' }, why: 'under a test runner (NODE_TEST_CONTEXT' },
+		{ env: {}, desktop: 'Background', why: "outside this Mac's desktop session" }
+	]) {
+		const label = JSON.stringify(scene.env);
+		const { mac, dev } = await mac_missing_trust();
+		mac.deps.env = { ...scene.env, SYNTAX_DEV_SETUP_DIALOGS: 'allow' };
+		mac.state.desktop = scene.desktop ?? 'Aqua';
+		const result = await setup_lab(mac, dev);
+		assert.equal(result.state, 'failed', label);
+		const [first] = describe_result({ name: 'lab' }, result, 1337);
+		assert.ok(first.startsWith(`Started ${scene.why}`), first);
+		assert.ok(first.endsWith(refused), first);
+		assert.deepEqual(privileged_commands(mac), [], label);
+	}
+});
+
 test('on Linux and Windows nothing runs, and the macOS-only message prints', async () => {
 	for (const platform of /** @type {const} */ (['linux', 'win32'])) {
 		const mac = await create_mac();

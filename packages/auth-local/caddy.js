@@ -2,6 +2,8 @@
 // .syntax.test routes to it through its admin API. Setup changes only a Caddy it has proven: its
 // API answers as Caddy's does, and it is either a `caddy` process or Syntax's own container.
 import { randomBytes } from 'node:crypto';
+import { request as http_request } from 'node:http';
+import { request as https_request } from 'node:https';
 import { isIP } from 'node:net';
 import { basename } from 'node:path';
 
@@ -32,6 +34,7 @@ const PORT_IN_USE = /address already in use|port is already allocated|ports are 
  * @property {number} admin_port
  * @property {number} https_port
  * @property {number} http_port
+ * @property {number} [api_start_timeout_ms] time allowed for the started container's API to answer
  * @property {<T>(task: () => Promise<T>) => Promise<T>} container_lock
  * @property {(run: import('./container.js').Run) => Promise<string | null>} ensure_docker
  * @property {string} setup_command the command that runs setup in a terminal
@@ -43,31 +46,78 @@ export function route_id(name) {
 }
 
 /**
+ * @typedef {{ status: number, json: unknown, text: string }} Answer status 0 when nothing answers
+ */
+
+/**
+ * Caddy checks browser origins when Sec-Fetch-Mode is present. `fetch` adds that header without
+ * an Origin, so use node:http instead; server-to-server requests carry neither header.
+ * @param {string} url
+ * @param {string} method
+ * @param {unknown} [body]
+ * @returns {Promise<Answer>}
+ */
+function local_request(url, method, body) {
+	const payload = body === undefined ? undefined : JSON.stringify(body);
+	const target = new URL(url);
+	const send = target.protocol === 'https:' ? https_request : http_request;
+	return new Promise((resolve) => {
+		/** @param {Answer} answer */
+		const finish = (answer) => {
+			clearTimeout(timer);
+			resolve(answer);
+		};
+		const outgoing = send(
+			target,
+			{
+				method,
+				headers:
+					payload === undefined
+						? {}
+						: {
+								'content-type': 'application/json',
+								'content-length': Buffer.byteLength(payload)
+							}
+			},
+			(response) => {
+				let text = '';
+				response.setEncoding('utf8');
+				response.on('data', (chunk) => (text += chunk));
+				response.on('end', () => {
+					let json = null;
+					try {
+						json = JSON.parse(text);
+					} catch {
+						// Not JSON; callers that need JSON check for it.
+					}
+					finish({ status: response.statusCode ?? 0, json, text });
+				});
+				response.on('error', (error) => finish({ status: 0, json: null, text: error.message }));
+			}
+		);
+		const timer = setTimeout(
+			() => outgoing.destroy(new Error(`no answer within ${API_TIMEOUT_MS / 1000} seconds`)),
+			API_TIMEOUT_MS
+		);
+		outgoing.on('error', (error) => finish({ status: 0, json: null, text: error.message }));
+		outgoing.end(payload);
+	});
+}
+
+/**
  * @param {{ admin_origin: string }} deps
  * @param {string} method
  * @param {string} path
  * @param {unknown} [body]
- * @returns {Promise<{ status: number, json: unknown, text: string }>} status 0 when nothing answers
+ * @returns {Promise<Answer>}
  */
-export async function caddy_api(deps, method, path, body) {
-	try {
-		const response = await fetch(`${deps.admin_origin}${path}`, {
-			method,
-			headers: body === undefined ? {} : { 'content-type': 'application/json' },
-			body: body === undefined ? undefined : JSON.stringify(body),
-			signal: AbortSignal.timeout(API_TIMEOUT_MS)
-		});
-		const text = await response.text();
-		let json = null;
-		try {
-			json = JSON.parse(text);
-		} catch {
-			// Not JSON; callers that need JSON check for it.
-		}
-		return { status: response.status, json, text };
-	} catch (error) {
-		return { status: 0, json: null, text: error instanceof Error ? error.message : String(error) };
-	}
+export function caddy_api(deps, method, path, body) {
+	return local_request(`${deps.admin_origin}${path}`, method, body);
+}
+
+/** @param {Answer} answer */
+function describe_answer(answer) {
+	return `${answer.status} "${api_error(answer)}"`;
 }
 
 /** @param {{ json: unknown, text: string }} response */
@@ -83,19 +133,41 @@ function is_object(value) {
 
 /**
  * Whether port 2019 answers as Caddy's admin API does: its config is a JSON object, and an unknown
- * `@id` gets Caddy's exact 404.
- * @param {CaddyDeps} deps
- * @returns {Promise<'absent' | 'other' | 'caddy'>}
+ * `@id` gets Caddy's exact 404. For `other`, `refused` is set when it answered with an error status
+ * rather than something that isn't Caddy's config.
+ * @param {{ admin_origin: string }} deps
+ * @returns {Promise<{ kind: 'absent' | 'caddy' } | { kind: 'other', refused: Answer | null }>}
  */
 export async function probe_caddy_api(deps) {
 	const config = await caddy_api(deps, 'GET', '/config/');
-	if (config.status === 0) return 'absent';
-	if (config.status !== 200 || !is_object(config.json)) return 'other';
+	if (config.status === 0) return { kind: 'absent' };
+	if (config.status >= 400) return { kind: 'other', refused: config };
+	if (config.status !== 200 || !is_object(config.json)) return { kind: 'other', refused: null };
 
 	const id = `syntax-test-probe-${randomBytes(8).toString('hex')}`;
 	const unknown = await caddy_api(deps, 'GET', `/id/${id}`);
 	const json = /** @type {{ error?: unknown } | null} */ (unknown.json);
-	return unknown.status === 404 && json?.error === `unknown object ID '${id}'` ? 'caddy' : 'other';
+	return unknown.status === 404 && json?.error === `unknown object ID '${id}'`
+		? { kind: 'caddy' }
+		: { kind: 'other', refused: unknown.status >= 400 && unknown.status !== 404 ? unknown : null };
+}
+
+/**
+ * What to do about a Caddy admin API that refused setup's request.
+ * @param {Answer} answer
+ * @param {string} otherwise the fix for any other refusal
+ */
+function refusal_fix(answer, otherwise) {
+	if (
+		answer.status === 403 &&
+		/not allowed to access from origin|Origin header/i.test(answer.text)
+	) {
+		return `Caddy refused it as a request from a browser or from an origin it doesn't allow (its admin \`origins\` or \`enforce_origin\` setting). ${otherwise}`;
+	}
+	if (answer.status === 403 && /host not allowed/i.test(answer.text)) {
+		return `Caddy refused the address setup used (its admin \`origins\` setting). ${otherwise}`;
+	}
+	return otherwise;
 }
 
 /**
@@ -191,21 +263,16 @@ async function prove_caddy(deps) {
 
 /** @param {CaddyDeps} deps @returns {Promise<string[] | Problem>} */
 async function find_docker_source_ranges(deps) {
-	try {
-		const response = await fetch(`http://127.0.0.1:${deps.http_port}${SOURCE_PATH}`, {
-			signal: AbortSignal.timeout(API_TIMEOUT_MS)
-		});
-		const address = (await response.text()).trim();
-		const version = isIP(address);
-		if (response.ok && version) return [`${address}/${version === 4 ? 32 : 128}`];
-		throw new Error(`it answered ${response.status} "${first_line(address)}"`);
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
-		return {
-			problem: `Syntax's Caddy container didn't say which address Docker forwards from (http://127.0.0.1:${deps.http_port}${SOURCE_PATH}: ${reason}), so it can't tell this computer's requests from others.`,
-			fix: `Remove the container with \`docker rm --force ${CADDY_CONTAINER}\` (its certificates stay in a volume), then restart dev.`
-		};
-	}
+	const answer = await local_request(`http://127.0.0.1:${deps.http_port}${SOURCE_PATH}`, 'GET');
+	const address = answer.text.trim();
+	const version = isIP(address);
+	if (answer.status === 200 && version) return [`${address}/${version === 4 ? 32 : 128}`];
+	const reason =
+		answer.status === 0 ? answer.text : `it answered ${answer.status} "${first_line(address)}"`;
+	return {
+		problem: `Syntax's Caddy container didn't say which address Docker forwards from (http://127.0.0.1:${deps.http_port}${SOURCE_PATH}: ${reason}), so it can't tell this computer's requests from others.`,
+		fix: `Remove the container with \`docker rm --force ${CADDY_CONTAINER}\` (its certificates stay in a volume), then restart dev.`
+	};
 }
 
 /** @param {CaddyDeps} deps @param {number} port @param {string} holder */
@@ -266,7 +333,7 @@ async function start_own_caddy(deps) {
 
 	return deps.container_lock(async () => {
 		// Another dev server may have started it while this one waited for the lock.
-		if ((await probe_caddy_api(deps)) === 'caddy') return null;
+		if ((await probe_caddy_api(deps)).kind === 'caddy') return null;
 
 		const own = await inspect_own_container(deps);
 		if (!own?.running) {
@@ -339,13 +406,37 @@ async function start_own_caddy(deps) {
 			};
 		}
 
-		const deadline = Date.now() + API_START_TIMEOUT_MS;
-		while (Date.now() < deadline) {
-			if ((await probe_caddy_api(deps)) === 'caddy') return null;
-			await sleep(500);
+		const timeout_ms = deps.api_start_timeout_ms ?? API_START_TIMEOUT_MS;
+		const deadline = Date.now() + timeout_ms;
+		let probe = await probe_caddy_api(deps);
+		while (probe.kind === 'absent' && Date.now() < deadline) {
+			await sleep(Math.min(500, deadline - Date.now()));
+			probe = await probe_caddy_api(deps);
+		}
+		if (probe.kind === 'caddy') return null;
+		const logs = `Check \`docker logs ${CADDY_CONTAINER}\` for the reason, then restart dev.`;
+		if (probe.kind === 'other' && probe.refused) {
+			return {
+				problem: `Syntax's Caddy container started, and its admin API on localhost:${deps.admin_port} answered, but refused setup's request with ${describe_answer(probe.refused)}.`,
+				fix: refusal_fix(
+					probe.refused,
+					probe.refused.status === 403 &&
+						/not allowed to access from origin|Origin header|host not allowed/i.test(
+							probe.refused.text
+						)
+						? `Correct Syntax Caddy's saved admin settings in \`/config/caddy/autosave.json\` inside ${CADDY_CONTAINER}: set \`admin.enforce_origin\` to false and \`admin.origins\` to ${JSON.stringify([`localhost:${deps.admin_port}`, `127.0.0.1:${deps.admin_port}`])}. Keep every other setting, route, and certificate volume. Run \`docker restart ${CADDY_CONTAINER}\`, then restart dev. Removing only the container won't reset its saved settings.`
+						: logs
+				)
+			};
+		}
+		if (probe.kind === 'other') {
+			return {
+				problem: `Syntax's Caddy container started, but what answers on localhost:${deps.admin_port} doesn't answer like Caddy's admin API.`,
+				fix: logs
+			};
 		}
 		return {
-			problem: `Syntax's Caddy container started, but its admin API didn't answer on localhost:${deps.admin_port} within 30 seconds.`,
+			problem: `Syntax's Caddy container started, but its admin API didn't answer on localhost:${deps.admin_port} within ${timeout_ms / 1000} seconds.`,
 			fix: `Check \`docker logs ${CADDY_CONTAINER}\` for the reason, then restart dev.`
 		};
 	});
@@ -359,17 +450,26 @@ async function start_own_caddy(deps) {
  */
 export async function find_caddy(deps, { can_change }) {
 	const status = await probe_caddy_api(deps);
-	if (status === 'other') {
+	if (status.kind === 'other') {
 		const found = await find_port_listeners(deps.admin_port, deps.run);
 		const holder =
 			('listeners' in found && describe_listeners(found.listeners)) ||
 			'a program setup couldn’t identify';
+		if (status.refused) {
+			return {
+				problem: `Port ${deps.admin_port} is in use by ${holder}, which answered setup's request for Caddy's config with ${describe_answer(status.refused)}, so setup can't add routes there or start its own Caddy.`,
+				fix: refusal_fix(
+					status.refused,
+					`If it's your Caddy, let requests from this computer reach its admin API on localhost:${deps.admin_port}; otherwise stop ${holder}. Then restart dev.`
+				)
+			};
+		}
 		return {
 			problem: `Port ${deps.admin_port} is in use by ${holder}, which doesn't answer like Caddy's admin API, so setup can't add routes there or start its own Caddy.`,
 			fix: `Stop ${holder}, then restart dev.`
 		};
 	}
-	if (status === 'absent') {
+	if (status.kind === 'absent') {
 		if (!can_change) {
 			return {
 				problem: `No Caddy answers on localhost:${deps.admin_port}, and setup only checks, never starts one, without a person at this computer's screen.`,

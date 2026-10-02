@@ -168,7 +168,40 @@ export async function start_fake_caddy({
 	const holder = { value: JSON.parse(initial) };
 	/** @type {string[]} */
 	const writes = [];
+	/** @type {{ method: string, path: string, headers: import('node:http').IncomingHttpHeaders }[]} */
+	const requests = [];
 	const server = create_http_server(async (request, response) => {
+		requests.push({
+			method: request.method ?? 'GET',
+			path: request.url ?? '/',
+			headers: request.headers
+		});
+		// Caddy 2.11.4 admin.go: browser headers trigger origin checking even without enforce_origin.
+		const admin = is_object(holder.value.admin) ? holder.value.admin : {};
+		const origin = request.headers.origin ?? '';
+		const origins = Array.isArray(admin.origins) ? admin.origins : [];
+		const has_browser_headers = 'origin' in request.headers || 'sec-fetch-mode' in request.headers;
+		if (
+			(admin.enforce_origin || has_browser_headers) &&
+			!origins.some((allowed) => {
+				if (typeof allowed !== 'string' || !origin) return false;
+				const url = new URL(allowed.includes('://') ? allowed : `http://${allowed}`);
+				try {
+					const from = new URL(origin);
+					return (
+						from.host === url.host && (!allowed.includes('://') || from.protocol === url.protocol)
+					);
+				} catch {
+					return false;
+				}
+			})
+		) {
+			response.writeHead(403, { 'content-type': 'application/json' });
+			response.end(
+				JSON.stringify({ error: `client is not allowed to access from origin '${origin}'` })
+			);
+			return;
+		}
 		let text = '';
 		for await (const chunk of request) text += chunk;
 		const body = text ? JSON.parse(text) : undefined;
@@ -215,6 +248,7 @@ export async function start_fake_caddy({
 		admin_port,
 		origin: `http://127.0.0.1:${admin_port}`,
 		writes,
+		requests,
 		/** @returns {Config} */
 		get config() {
 			return holder.value;

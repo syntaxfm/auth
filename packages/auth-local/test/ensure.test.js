@@ -212,7 +212,7 @@ test('two dev servers starting at once open Docker once, and both start', async 
 			{ warnings: [], updaters: 1 },
 			{ warnings: [], updaters: 1 }
 		]);
-		assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+		assert.deepEqual(docker.opens(), ['open -a Docker']);
 		assert.equal(docker.calls.filter((call) => call.startsWith('docker run')).length, 1);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -234,7 +234,7 @@ test("a dev server that waited for another's Docker start gets that start's fail
 			{ warnings: [message], updaters: 0 },
 			{ warnings: [message], updaters: 0 }
 		]);
-		assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+		assert.deepEqual(docker.opens(), ['open -a Docker']);
 
 		// A start after both ended is a retry: it opens Docker itself.
 		assert.deepEqual(await start_on(docker, directory, lock_port), {
@@ -253,7 +253,7 @@ test("a dev server that waited for another's start gets the same message when th
 		const docker = sleeping_docker(null, { open_stalls: true });
 		const lock_port = await free_port();
 		const message =
-			"Running signed out: `open --background -a Docker` didn't finish within 30 seconds, so local Syntax Auth's startup stopped it. macOS didn't finish opening the Docker app. Open Docker Desktop or OrbStack yourself, then restart dev.";
+			"Running signed out: `open -a Docker` didn't finish within 30 seconds, so local Syntax Auth's startup stopped it. macOS didn't finish opening the Docker app. Open Docker Desktop or OrbStack yourself, then restart dev.";
 		const both = await Promise.all([
 			start_on(docker, directory, lock_port),
 			start_on(docker, directory, lock_port)
@@ -262,7 +262,7 @@ test("a dev server that waited for another's start gets the same message when th
 			{ warnings: [message], updaters: 0 },
 			{ warnings: [message], updaters: 0 }
 		]);
-		assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+		assert.deepEqual(docker.opens(), ['open -a Docker']);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -375,7 +375,7 @@ test('SYNTAX_DEV_SETUP_DIALOGS=allow lets an agent shell at the screen open Dock
 				SYNTAX_DEV_SETUP_DIALOGS: 'allow'
 			});
 			assert.deepEqual(result, { warnings: [], updaters: 1 });
-			assert.deepEqual(docker.opens(), ['open --background -a Docker']);
+			assert.deepEqual(docker.opens(), ['open -a Docker']);
 		}
 	} finally {
 		await rm(directory, { recursive: true, force: true });

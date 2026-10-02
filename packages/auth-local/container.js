@@ -691,11 +691,8 @@ async function start_docker_app(run_command, { ready_timeout_ms, poll_ms }) {
 		: ['Docker Desktop', 'OrbStack'];
 
 	for (const app of apps) {
-		const opened = await run_command('open', [
-			'--background',
-			'-a',
-			app === 'Docker Desktop' ? 'Docker' : app
-		]);
+		// Docker Desktop can crash its Electron startup when `open --background` is used.
+		const opened = await run_command('open', ['-a', app === 'Docker Desktop' ? 'Docker' : app]);
 		if (opened.code !== 0) continue;
 
 		log(`Starting ${app}`);
@@ -710,8 +707,8 @@ async function start_docker_app(run_command, { ready_timeout_ms, poll_ms }) {
 }
 
 /**
- * Opens the Docker app at most once at a time on this Mac: two app instances opening it together
- * crash Docker Desktop. The start runs under the container lock and keeps its outcome, a stalled or
+ * Opens the Docker app at most once at a time on this Mac, so concurrent dev starts don't race.
+ * The start runs under the container lock and keeps its outcome, a stalled or
  * failed command included, before letting go of it; an instance that waited for it re-checks
  * Docker, and when the start it waited for failed, gives that start's message instead of opening
  * the app again.

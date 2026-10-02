@@ -117,6 +117,32 @@ syntaxfm members, pulls it with their GitHub CLI login without storing the token
 `CONSUMING_AUTH.md`. The port lives in `packages/auth-local/container.js`,
 `vite.config.ts`, and the `local` and `oauth-registration` envs in `wrangler.jsonc`.
 
+### https://auth.syntax.test
+
+On macOS, `pnpm dev` also makes `https://auth.syntax.test` answer, through the same plugin
+(`syntax_auth({ name: 'auth' })` in `vite.config.ts`), as every Syntax app's dev server does for
+its own name. `CONSUMING_AUTH.md` describes each step; the first start asks for your password once
+(for `/etc/hosts`) and one approval (to trust Caddy's local root), and later starts ask nothing.
+Syntax Auth's own dev server never redirects `localhost`, because apps call it there. Where nobody
+can answer a dialog (over SSH, in CI), run `node packages/auth-local/bin.js setup auth` in Terminal
+at the Mac's own screen instead.
+
+Setup leaves everything in place when dev stops. To undo it:
+
+```sh
+# The routes and certificate policy, from whichever Caddy got them:
+for id in syntax-test-auth syntax-test-lab syntax-test-website syntax-test-tls; do
+	curl -X DELETE "localhost:2019/id/$id"
+done
+# Syntax's own Caddy container, if setup started one, and its certificates:
+docker rm --force syntax-caddy && docker volume rm syntax-caddy-data syntax-caddy-config
+# Trust in Caddy's root (find its SHA-1 with the first command):
+security find-certificate -a -Z -c "Caddy Local Authority" ~/Library/Keychains/login.keychain-db
+security delete-certificate -Z <sha1> ~/Library/Keychains/login.keychain-db
+# The hosts block (/etc/hosts.syntax-test.bak holds the file from before the last change):
+sudo sed -i '' '/^# >>> syntax.test: added by Syntax dev setup/,/^# <<< syntax.test$/d' /etc/hosts
+```
+
 Useful commands:
 
 ```sh
@@ -130,9 +156,12 @@ pnpm db:generate
 pnpm d1:migration:create <migration-name>
 ```
 
-`pnpm test` runs the unit tests and an integration test that builds the app, serves it with
+`pnpm test` runs the unit tests, an integration test that builds the app, serves it with
 `vite preview` on a free port with a temporary D1, and signs in on `localhost` and
-`auth.syntax.test`. It never touches port 37960, the container, or `.wrangler/state`.
+`auth.syntax.test`, and the `packages/auth-local` tests (also `pnpm --dir packages/auth-local
+test`). Those run setup against stand-ins for Caddy, docker, the password dialog (the real hosts
+script edits a temporary file), and macOS's `security`. None of them touches port 37960, the
+container, `.wrangler/state`, `/etc/hosts`, the keychain, or ports 80, 443, and 2019.
 
 `drizzle.config.ts` is intentionally generation-only: it declares the SQLite schema and migrations
 directory without inventing a local SQLite URL or storing Cloudflare credentials. Apply migrations

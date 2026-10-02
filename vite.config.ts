@@ -1,6 +1,8 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig, type Connect, type Plugin } from 'vite';
 
+import { syntax_auth } from './packages/auth-local/index.js';
+
 import {
 	SYNTAX_TEST_AUTH_HOSTNAME,
 	get_host_header_hostname,
@@ -44,5 +46,7 @@ export default defineConfig({
 	preview: {
 		allowedHosts: [SYNTAX_TEST_AUTH_HOSTNAME]
 	},
-	plugins: [refuse_other_hosts(), sveltekit()]
+	// On `pnpm dev`, sets up https://auth.syntax.test (hosts file, Caddy route, certificate trust).
+	// scripts/local_server.js already stands in for the container, so the plugin skips it.
+	plugins: [refuse_other_hosts(), syntax_auth({ name: 'auth' }), sveltekit()]
 });

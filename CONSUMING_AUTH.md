@@ -154,7 +154,55 @@ two addresses to use instead. A request from an origin it doesn't trust gets a 4
 Syntax apps can also run locally on three HTTPS names, served by a local HTTPS proxy:
 `https://syntax.test` (the website), `https://lab.syntax.test` (Lab), and `https://auth.syntax.test`
 (local Syntax Auth). On those names, as in production, one cookie on the parent domain
-(`.syntax.test`) signs a browser in to every app:
+(`.syntax.test`) signs a browser in to every app.
+
+Give the plugin the app's name to set its name up whenever its dev server starts (never under
+Vitest or in a build). `port` is where the name forwards, by default the port Vite listens on; an
+app whose dev server sits behind another (Lab under `alchemy dev`) passes that one. `routes` sends
+paths to other local servers:
+
+```ts
+syntax_auth({ name: 'lab', port: 1337, routes: [{ path: '/parties/*', port: 1999 }] });
+```
+
+On macOS, each start makes sure of these steps, in order, without delaying the dev server. A step
+that is already done is skipped, so after the first start nothing asks again:
+
+1. **Hosts file.** `/etc/hosts` gets any missing `127.0.0.1` and `::1` entries for the three names,
+   in one block marked `# >>> syntax.test` … `# <<< syntax.test`. Changing it asks for your password
+   (or Touch ID) in a macOS dialog. A fixed script, never a file anyone could edit, then re-reads the
+   file, saves it as `/etc/hosts.syntax-test.bak`, rewrites only that block through a copy moved
+   into place, and clears the DNS cache; an interrupted edit leaves the old file or the new one.
+   Other lines stay as they are, and a name another line points elsewhere is left alone and
+   reported. One setup runs at a time on the machine, and a dialog left open closes after 5 minutes.
+2. **HTTPS proxy.** If Caddy's admin API answers on `localhost:2019` and is proven to be Caddy
+   (it answers as Caddy's does, and the program listening is `caddy`), setup adds its routes there,
+   first in the port 443 server, and leaves every other route alone. Otherwise it starts Syntax's
+   own `syntax-caddy` container from the official Caddy image, pinned by digest, published on
+   `127.0.0.1` only (ports 443, 80, and 2019), with its certificates in a Docker volume; a program
+   already on one of those ports is named instead. Each name gets a route with the `@id`
+   `syntax-test-<name>` (`syntax-test-auth` forwards to port 37960 on every start), plus one
+   `tls internal` certificate policy, `syntax-test-tls`. Only this computer and its tailnet
+   (`100.64.0.0/10`) get through; any other client gets a 403. While dev runs, setup checks every
+   15 seconds and adds the routes back if Caddy lost them (a restart or `caddy reload`).
+3. **Certificate trust.** Setup reads the root certificate from that Caddy's own certificate
+   authority, checks that it issued the certificate Caddy serves for the names, and trusts it in
+   your login keychain with one macOS approval. A root that didn't issue it is refused, with the
+   reason. If you decline, the certificate macOS added is removed again.
+4. **Final check.** The names resolve to this computer, Caddy has the routes, macOS trusts the
+   certificate, and `https://<name>` reaches this very dev server.
+
+Then the dev server prints `https://<name> is ready.`, and page loads on `localhost` (or
+`127.0.0.1`) go to the same path on the https name; scripts' requests are never redirected. If a
+step fails, the dev server prints the step, what failed, and its fix, keeps running on `localhost`,
+and answers page loads there with a page naming the same, with a link to keep that browser on
+`localhost` for now. A retry (restart dev) is always safe. Where nobody can answer a dialog (over
+SSH, or with `CI` set), setup changes nothing and prints each fix, such as running
+`pnpm exec syntax-auth-local setup <name>` in Terminal at the Mac's own screen. On Linux and Windows
+it changes nothing and says that automatic setup is macOS-only for now. The routes stay in Caddy
+when dev stops; Syntax Auth's `README.md` shows how to undo every step.
+
+On those names:
 
 - Send browsers to `https://auth.syntax.test`, for example
   `https://auth.syntax.test/sign-in?return_to=<encoded app URL>`. Local Syntax Auth accepts

@@ -1,4 +1,5 @@
-// Docker and locking internals shared by the dev-server entry (index.js) and the detached updater.
+// Docker, process, and locking internals shared by the dev-server entry (index.js), the .syntax.test
+// setup (setup.js), and the detached updater.
 import { spawn } from 'node:child_process';
 import { access, constants, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -10,32 +11,43 @@ export const SYNTAX_AUTH_LOCAL_ORIGIN = `http://localhost:${SYNTAX_AUTH_LOCAL_PO
 export const CONTAINER_NAME = 'syntax-auth';
 export const IMAGE = 'ghcr.io/syntaxfm/auth-local:latest';
 
-// Holding this port is the machine-wide lock for changing the container. The OS releases it the
-// moment the holder exits, so a crashed or interrupted process can never leave a stale lock.
-const LOCK_PORT = 37961;
+// Holding one of these ports is a machine-wide lock: 37961 for changing a container, 37962 for the
+// .syntax.test setup. The OS releases it the moment the holder exits, so a crashed or interrupted
+// process can never leave a stale lock.
+export const CONTAINER_LOCK_PORT = 37961;
+export const SETUP_LOCK_PORT = 37962;
 const LOCK_TIMEOUT_MS = 300_000;
+const DOCKER_START_TIMEOUT_MS = 120_000;
 const VOLUME_NAME = 'syntax-auth';
 const NAME_IN_USE = 'is already in use';
 
+/** @param {number} ms */
 export function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** @param {string} message */
 export function log(message) {
 	console.log(`[syntax-auth] ${message}`);
 }
 
+/** @param {string} message */
 export function warn(message) {
 	console.warn(`[syntax-auth] ${message}`);
 }
 
 /**
- * @param {string} command
- * @param {string[]} args
- * @param {{ input?: string, env?: NodeJS.ProcessEnv }} [options]
- * @returns {Promise<{ code: number | null, stdout: string, stderr: string }>}
+ * @typedef {{ code: number | null, stdout: string, stderr: string, timed_out?: boolean }} RunResult
+ * @typedef {(command: string, args: string[], options?: RunOptions) => Promise<RunResult>} Run
+ * @typedef {{ input?: string, env?: NodeJS.ProcessEnv, timeout_ms?: number }} RunOptions
  */
-function run(command, args, { input, env } = {}) {
+
+/**
+ * Runs a command to completion. Never throws: a missing command gives code null and its error. A
+ * command still running after `timeout_ms` is killed and gives `timed_out: true`.
+ * @type {Run}
+ */
+export function run(command, args, { input, env, timeout_ms } = {}) {
 	return new Promise((resolve) => {
 		const child = spawn(command, args, {
 			env: env ?? process.env,
@@ -43,10 +55,31 @@ function run(command, args, { input, env } = {}) {
 		});
 		let stdout = '';
 		let stderr = '';
+		let timed_out = false;
+		const timer = timeout_ms
+			? setTimeout(() => {
+					timed_out = true;
+					child.kill('SIGTERM');
+				}, timeout_ms)
+			: undefined;
 		child.stdout.on('data', (chunk) => (stdout += chunk));
 		child.stderr.on('data', (chunk) => (stderr += chunk));
-		child.on('error', (error) => resolve({ code: null, stdout, stderr: error.message }));
-		child.on('close', (code) => resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() }));
+		child.on('error', (error) => {
+			clearTimeout(timer);
+			resolve({ code: null, stdout, stderr: error.message });
+		});
+		child.on('close', (code) => {
+			clearTimeout(timer);
+			resolve({
+				code,
+				stdout: stdout.trim(),
+				stderr: stderr.trim(),
+				...(timed_out && { timed_out })
+			});
+		});
+		child.stdin.on('error', () => {
+			// The command exited before reading its input; `close` reports how it ended.
+		});
 		child.stdin.end(input);
 	});
 }
@@ -66,6 +99,7 @@ export function first_line(text) {
 	return text.split('\n').find((line) => line.trim() !== '') ?? text;
 }
 
+/** @param {string} stderr */
 function is_access_denied(stderr) {
 	return /unauthorized|denied|forbidden/i.test(stderr);
 }
@@ -180,6 +214,39 @@ export async function pull_image() {
 		: `local Syntax Auth's Docker image couldn't be downloaded: ${first_line(team_pull.result.stderr)}`;
 }
 
+/**
+ * Every TCP listener on `port`, from macOS's `netstat -anv`, which (unlike `lsof`) also shows
+ * processes owned by other users, such as a Caddy run by root.
+ * @param {number} port
+ * @param {Run} [run_command]
+ * @returns {Promise<{ address: string, process: string, pid: number }[]>}
+ */
+export async function find_port_listeners(port, run_command = run) {
+	const result = await run_command('netstat', ['-anv', '-p', 'tcp']);
+	/** @type {{ address: string, process: string, pid: number }[]} */
+	const listeners = [];
+	for (const line of result.stdout.split('\n')) {
+		// tcp46  0  0  *.443  *.*  LISTEN  0 0 131072 131072  caddy:610  00180 …
+		const match = line.match(
+			/^tcp(?:46|4|6)\s+\d+\s+\d+\s+(\S+)\.(\d+)\s+\S+\s+LISTEN\s+(?:\d+\s+){4}(.+?):(\d+)\s+[0-9a-f]{5}\s/
+		);
+		if (!match || Number(match[2]) !== port) continue;
+		listeners.push({ address: match[1], process: match[3], pid: Number(match[4]) });
+	}
+	return listeners;
+}
+
+/**
+ * @param {{ process: string, pid: number }[]} listeners
+ * @returns {string} like "nginx (pid 123)" or "nginx (pid 123) and caddy (pid 456)"
+ */
+export function describe_listeners(listeners) {
+	const names = [
+		...new Set(listeners.map((listener) => `${listener.process} (pid ${listener.pid})`))
+	];
+	return names.join(' and ');
+}
+
 /** @returns {Promise<string | null>} the program listening on the local port, like "python3 (pid 123)" */
 export async function find_port_holder() {
 	const result = await run('lsof', [
@@ -242,7 +309,8 @@ export async function create_container() {
 	return result.code === 0 || result.stderr.includes(NAME_IN_USE) ? null : result.stderr;
 }
 
-function acquire_lock() {
+/** @param {number} port @returns {Promise<import('node:net').Server>} */
+function acquire_lock(port) {
 	return new Promise((resolve, reject) => {
 		const deadline = Date.now() + LOCK_TIMEOUT_MS;
 
@@ -251,11 +319,15 @@ function acquire_lock() {
 			server.once('error', (error) => {
 				if (error.code !== 'EADDRINUSE') return reject(error);
 				if (Date.now() > deadline) {
-					return reject(new Error('Timed out waiting for another Syntax app to start auth'));
+					return reject(
+						new Error(
+							'Timed out after 5 minutes waiting for another Syntax dev server to finish its setup'
+						)
+					);
 				}
 				setTimeout(attempt, 250);
 			});
-			server.listen({ host: '127.0.0.1', port: LOCK_PORT, exclusive: true }, () => {
+			server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
 				server.unref();
 				resolve(server);
 			});
@@ -266,16 +338,84 @@ function acquire_lock() {
 }
 
 /**
- * Runs `task` while no other process on this machine is changing the container.
+ * Runs `task` while no other process on this machine holds the lock on `port`.
  * @template T
+ * @param {number} port
  * @param {() => Promise<T>} task
  * @returns {Promise<T>}
  */
-export async function with_container_lock(task) {
-	const lock = await acquire_lock();
+export async function with_port_lock(port, task) {
+	const lock = await acquire_lock(port);
 	try {
 		return await task();
 	} finally {
 		lock.close();
 	}
+}
+
+/**
+ * Runs `task` while no other process on this machine is changing a container.
+ * @template T
+ * @param {() => Promise<T>} task
+ * @returns {Promise<T>}
+ */
+export function with_container_lock(task) {
+	return with_port_lock(CONTAINER_LOCK_PORT, task);
+}
+
+/** @param {Run} run_command */
+async function is_docker_running(run_command) {
+	return (await run_command('docker', ['info', '--format', '{{.ServerVersion}}'])).code === 0;
+}
+
+// On macOS, opens the Docker app that Docker's current context points at, then waits for it.
+/**
+ * @param {Run} run_command
+ * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
+ */
+async function start_docker_app(run_command) {
+	const context = await run_command('docker', [
+		'context',
+		'inspect',
+		'--format',
+		'{{.Endpoints.docker.Host}}'
+	]);
+	const apps = context.stdout.includes('orbstack')
+		? ['OrbStack', 'Docker Desktop']
+		: ['Docker Desktop', 'OrbStack'];
+
+	for (const app of apps) {
+		const opened = await run_command('open', [
+			'--background',
+			'-a',
+			app === 'Docker Desktop' ? 'Docker' : app
+		]);
+		if (opened.code !== 0) continue;
+
+		log(`Starting ${app}`);
+		const deadline = Date.now() + DOCKER_START_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			if (await is_docker_running(run_command)) return null;
+			await sleep(1_000);
+		}
+		return `${app} was opened, but Docker wasn't ready after 2 minutes. Check ${app} for an error or a prompt, then restart dev.`;
+	}
+	return 'Docker is installed but not running, and neither Docker Desktop nor OrbStack is installed to start it. Start your Docker engine, then restart dev.';
+}
+
+/**
+ * @param {Run} [run_command]
+ * @returns {Promise<string | null>} null when Docker is ready, otherwise what is wrong.
+ */
+export async function ensure_docker(run_command = run) {
+	const info = await run_command('docker', ['info', '--format', '{{.ServerVersion}}']);
+	if (info.code === 0) return null;
+	if (is_missing_command(info)) {
+		return "Docker isn't installed. Install Docker Desktop (https://www.docker.com/products/docker-desktop/) or OrbStack (https://orbstack.dev), then restart dev.";
+	}
+	if (/permission denied/i.test(info.stderr)) {
+		return `Docker is installed, but your user can't use it (${first_line(info.stderr)}). On Linux, add yourself to the docker group (https://docs.docker.com/engine/install/linux-postinstall/), then restart dev.`;
+	}
+	if (process.platform === 'darwin') return start_docker_app(run_command);
+	return `Docker is installed but not running (${first_line(info.stderr)}). Start it (for example \`sudo systemctl start docker\`), then restart dev.`;
 }

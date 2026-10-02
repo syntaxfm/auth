@@ -111,7 +111,10 @@ identical to production. It needs no secrets, 1Password, or GitHub OAuth App.
    Every dev server start then makes sure the one shared `syntax-auth` container is running,
    whether or not any other Syntax app is already running, without delaying the dev server. Any number of
    apps may start at once: container changes are serialized by a machine-wide lock that the OS
-   releases even if a process crashes. It opens Docker Desktop on macOS when needed, pulls newer
+   releases even if a process crashes. It opens Docker Desktop (or OrbStack) on macOS when needed
+   and a person is at the Mac's screen (see below for when it never does), under the same lock, so
+   the app is opened only once at a time: a second app starting meanwhile waits for that start and,
+   if it failed or stalled, prints the same message instead of opening it again. It pulls newer
    images and swaps them in from a detached process, keeps local users and sessions in a Docker
    volume, and skips Vitest. If Docker is missing or stopped, the image is not accessible, or
    another program holds the port, it prints one warning naming the exact problem and its fix, and
@@ -154,7 +157,97 @@ two addresses to use instead. A request from an origin it doesn't trust gets a 4
 Syntax apps can also run locally on three HTTPS names, served by a local HTTPS proxy:
 `https://syntax.test` (the website), `https://lab.syntax.test` (Lab), and `https://auth.syntax.test`
 (local Syntax Auth). On those names, as in production, one cookie on the parent domain
-(`.syntax.test`) signs a browser in to every app:
+(`.syntax.test`) signs a browser in to every app.
+
+Give the plugin the app's name to set its name up whenever its dev server starts (never under
+Vitest or in a build). `port` is where the name forwards, by default the port Vite listens on; an
+app whose dev server sits behind another (Lab under `alchemy dev`) passes that one. `routes` sends
+paths to other local servers:
+
+```ts
+syntax_auth({ name: 'lab', port: 1337, routes: [{ path: '/parties/*', port: 1999 }] });
+```
+
+On macOS, each start makes sure of these steps, in order, without delaying the dev server. A step
+that is already done is skipped, so after the first start nothing asks again:
+
+1. **Hosts file.** `/etc/hosts` gets any missing `127.0.0.1` and `::1` entries for the three names,
+   in one block marked `# >>> syntax.test` … `# <<< syntax.test`. Changing it asks for your password
+   (or Touch ID) in a macOS dialog. A fixed script, never a file anyone could edit, then checks the
+   file is still the one setup planned from (if another program changed it while the dialog was
+   open, it changes nothing and says so), saves it as `/etc/hosts.syntax-test.bak`, rewrites only
+   that block through a copy moved into place, and clears the DNS cache; an interrupted edit leaves
+   the old file or the new one. Every byte outside the block stays as it was, CRLF line endings and
+   a missing final newline included, and a name another line points elsewhere is left alone and
+   reported. A damaged block (a marker without its partner, two blocks, or an altered marker line)
+   is refused with its fix. One setup runs at a time on the machine, and a dialog left open closes
+   after 5 minutes.
+2. **HTTPS proxy.** If Caddy's admin API answers on `127.0.0.1:2019` and is proven to be Caddy
+   (it answers as Caddy's does, and the one program listening on `127.0.0.1:2019`, or on a wildcard
+   address that covers it, is `caddy`), setup adds its routes there, first in the port 443 server,
+   and leaves every other route alone. If a route it didn't add matches a name at any depth (inside
+   a subroute, in a host list, or by a wildcard such as `*.syntax.test`), setup names that route and
+   changes nothing. Otherwise it starts Syntax's
+   own `syntax-caddy` container from the official Caddy image, pinned by digest, published on
+   `127.0.0.1` only (ports 443, 80, and 2019), with its certificates in a Docker volume; a program
+   already on one of those ports is named instead, and if setup can't read which programs listen,
+   it stops rather than assume the ports are free. Each name gets a route with the `@id`
+   `syntax-test-<name>` (`syntax-test-auth` forwards to port 37960 on every start), plus one
+   `tls internal` certificate policy, `syntax-test-tls`. Only this computer and its tailnet
+   (`100.64.0.0/10`) get through; any other client gets a 403. While dev runs, setup checks every
+   15 seconds and adds the routes back if Caddy lost them (a restart or `caddy reload`).
+3. **Certificate trust.** Setup reads the root certificate from that Caddy's own certificate
+   authority, checks that it issued the certificate Caddy serves for the names, and trusts it in
+   your login keychain with one macOS approval. A root that didn't issue it is refused, with the
+   reason. If you decline, the certificate macOS added is removed again.
+4. **Final check.** The names resolve to this computer, Caddy has the routes, macOS trusts the
+   certificate, and `https://<name>` reaches this very dev server.
+
+Then the dev server prints `https://<name> is ready.`, and page loads on `localhost` (or
+`127.0.0.1`) go to the same path on the https name; scripts' requests are never redirected. If a
+step fails, the dev server prints the step, what failed, and its fix, keeps running on `localhost`,
+and answers page loads there with a page naming the same, with a link to keep that browser on
+`localhost` for now. A retry (restart dev) is always safe, and a command that stalls is stopped
+with a message naming it.
+
+Setup shows its password and approval dialogs only when a person is likely at the Mac's screen.
+It shows none, changes nothing, and prints each fix when dev (or `syntax-auth-local setup`)
+starts:
+
+- from an AI coding agent's shell (`CLAUDECODE` or `PI_CODING_AGENT` set), so an agent checking
+  a page never makes a dialog appear in front of you;
+- over SSH (`SSH_CONNECTION` or `SSH_TTY` set), in CI (`CI` set), or under a test runner
+  (`NODE_TEST_CONTEXT` or `VITEST` set);
+- outside the Mac's desktop session (`launchctl managername` isn't `Aqua`).
+
+Each of these variables counts when it is set at all, whatever its value: `CI=`, `CI=0`, and
+`CI=false` all mean CI. Only an unset variable is absent.
+
+Its first line says which one, for example "Started from an agent shell (PI_CODING_AGENT), so
+setup didn't show any dialogs and changed nothing." Each fix after it is a command to run in
+Terminal at the Mac's own screen, such as
+`pnpm exec syntax-auth-local setup lab --port 1337 --route '/parties/*=1999'` (the dev server
+prints it with its own port and routes); `setup lab` and `setup website` need `--port`. When you
+are watching the screen and want an agent's run to show the dialogs, start it with
+`SYNTAX_DEV_SETUP_DIALOGS=allow`, for example `SYNTAX_DEV_SETUP_DIALOGS=allow pnpm dev`. That
+switch never works over SSH, in CI, or under a test runner.
+
+In those same cases nothing opens Docker Desktop or OrbStack either, since their first run and
+privileged helper can show dialogs of their own: not a dev server with a name, not one without,
+and not `syntax-auth-local`. If Docker isn't running, the app runs signed out with a message
+such as "Docker isn't running, and this dev server was started from an agent shell
+(PI_CODING_AGENT), so it didn't open Docker Desktop or OrbStack. Start Docker Desktop (or
+OrbStack), then restart dev." When Docker already runs, an agent's dev server still starts the
+local Syntax Auth container, which shows no dialog. `SYNTAX_DEV_SETUP_DIALOGS=allow`, at the
+Mac's screen, lets it open Docker too.
+
+On Linux and Windows setup changes nothing and says that automatic setup is macOS-only for now.
+There, and over SSH, in CI, under a test runner, or outside the desktop session, a named dev
+server also leaves Docker and the local Syntax Auth container alone: if Syntax Auth isn't
+running, it says to start it with `pnpm exec syntax-auth-local`. The routes stay in Caddy when dev stops; Syntax Auth's `README.md`
+shows how to undo every step.
+
+On those names:
 
 - Send browsers to `https://auth.syntax.test`, for example
   `https://auth.syntax.test/sign-in?return_to=<encoded app URL>`. Local Syntax Auth accepts

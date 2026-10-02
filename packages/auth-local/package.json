@@ -1,7 +1,7 @@
 {
 	"name": "@syntaxfm/auth-local",
 	"version": "1.0.0",
-	"description": "Starts the shared local Syntax Auth container for any Syntax app's dev server.",
+	"description": "Starts the shared local Syntax Auth container, and sets up the https://*.syntax.test names, for any Syntax app's dev server.",
 	"type": "module",
 	"exports": {
 		".": {
@@ -12,12 +12,23 @@
 	"bin": {
 		"syntax-auth-local": "./bin.js"
 	},
+	"scripts": {
+		"test": "node --test 'test/*.test.js'"
+	},
 	"files": [
 		"index.js",
 		"index.d.ts",
 		"container.js",
 		"update.js",
-		"bin.js"
+		"bin.js",
+		"cli.js",
+		"names.js",
+		"hosts_file.js",
+		"caddy.js",
+		"trust.js",
+		"setup.js",
+		"plugin.js",
+		"problem_page.js"
 	],
 	"engines": {
 		"node": ">=22"

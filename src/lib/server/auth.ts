@@ -8,6 +8,7 @@ import { SYNTAX_TEST_TRUSTED_ORIGINS } from '../utils/local_hosts';
 import * as schema from './db/schema';
 import type { AuthEnvironment } from './env';
 import { LOCAL_DEVELOPER } from './local_developer';
+import { get_oauth_valid_audiences } from './oauth_audiences';
 
 export function create_auth(env: AuthEnvironment) {
 	const database = drizzle(env.DB, { schema });
@@ -80,6 +81,8 @@ export function create_auth(env: AuthEnvironment) {
 				scopes: ['openid', 'profile', 'email', 'offline_access'],
 				allowDynamicClientRegistration: false,
 				allowUnauthenticatedClientRegistration: false,
+				// Without this, Better Auth accepts only its own base URL as a token `resource`.
+				validAudiences: get_oauth_valid_audiences(better_auth_origin),
 				silenceWarnings: {
 					oauthAuthServerConfig: true
 				}

@@ -12,7 +12,7 @@ function form_post(path: string, headers: Record<string, string> = {}, method = 
 		headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
 		body: 'grant_type=authorization_code'
 	});
-	return refuse_cross_site_form(request, url);
+	return refuse_cross_site_form(request);
 }
 
 test('a native client may post forms to the token and revocation endpoints with no Origin', () => {
@@ -24,6 +24,8 @@ test('a native client may post forms to the token and revocation endpoints with 
 test('every other path still refuses a form post from another site or with no Origin, as SvelteKit did', async () => {
 	for (const [path, headers] of [
 		['/api/auth/oauth2/token/', {}],
+		['/api/auth/oauth2/token/__data.json', {}],
+		['/api/auth/oauth2/%74oken', {}],
 		['/api/auth/oauth2/consent', {}],
 		['/api/auth/sign-out', { origin: 'https://evil.example' }],
 		['/consent', { origin: 'null' }]
@@ -56,6 +58,5 @@ test('same-site form posts, other content types, and GETs go on', () => {
 	assert.equal(form_post('/api/auth/sign-out', { origin: ORIGIN }), null);
 	assert.equal(form_post('/consent', { 'content-type': 'application/json' }), null);
 
-	const url = new URL('/consent', ORIGIN);
-	assert.equal(refuse_cross_site_form(new Request(url), url), null);
+	assert.equal(refuse_cross_site_form(new Request(new URL('/consent', ORIGIN))), null);
 });

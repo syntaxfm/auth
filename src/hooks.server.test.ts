@@ -535,8 +535,8 @@ test("native OAuth clients' token requests reach Better Auth, while other cross-
 		headers: form_headers,
 		body: 'grant_type=authorization_code&code=made-up&client_id=made-up&code_verifier=made-up'
 	});
-	assert.notEqual(token.status, 403, token.body);
-	assert.doesNotMatch(token.body, /Cross-site/);
+	assert.ok([400, 401].includes(token.status), `${token.status} ${token.body}`);
+	assert.equal(typeof JSON.parse(token.body).error, 'string', token.body);
 
 	const revoke = await send('/api/auth/oauth2/revoke', {
 		host: loopback_host,
@@ -544,6 +544,7 @@ test("native OAuth clients' token requests reach Better Auth, while other cross-
 		headers: form_headers,
 		body: 'token=made-up&client_id=made-up'
 	});
+	assert.ok([200, 400, 401].includes(revoke.status), `${revoke.status} ${revoke.body}`);
 	assert.doesNotMatch(revoke.body, /Cross-site/);
 
 	for (const headers of [form_headers, { ...form_headers, origin: 'https://evil.example' }]) {

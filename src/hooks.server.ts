@@ -12,10 +12,10 @@ export const handle: Handle = async ({ event, resolve }) => {
 	event.locals.user = null;
 	event.locals.is_local_development = false;
 
-	// SvelteKit's own cross-site form check, run first as SvelteKit ran it (and, like it, only in
-	// built servers), except on the endpoints native OAuth clients post to.
-	if (!dev && !building) {
-		const refusal = refuse_cross_site_form(event.request, event.url);
+	// SvelteKit's own cross-site form check, run first, in built servers as SvelteKit ran it,
+	// except on the endpoints native OAuth clients post to (src/lib/server/cross_site_forms.ts).
+	if (!dev) {
+		const refusal = refuse_cross_site_form(event.request);
 		if (refusal) return refusal;
 	}
 

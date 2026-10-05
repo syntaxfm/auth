@@ -26,8 +26,9 @@ import {
 	with_container_lock,
 	with_startup_limits
 } from './container.js';
+import { create_local_auth_caller } from './local_auth.js';
 import { create_plugin } from './plugin.js';
-import { default_setup_deps, why_not_open } from './setup.js';
+import { why_not_open } from './presence.js';
 
 const READY_TIMEOUT_MS = 180_000;
 const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
@@ -35,7 +36,7 @@ const UPDATER_PATH = fileURLToPath(new URL('./update.js', import.meta.url));
 /**
  * @typedef {object} EnsureOptions
  * @property {boolean} [can_start] false: only check, never start Docker, the container, or the updater
- * @property {NodeJS.ProcessEnv} [env] decides whether the Docker app may be opened (see why_not_open)
+ * @property {NodeJS.ProcessEnv} [env] decides whether the Docker app may be opened (presence.js)
  * @property {import('./container.js').Run} [run]
  * @property {() => Promise<boolean>} [is_healthy]
  * @property {() => void} [start_updater]
@@ -128,13 +129,13 @@ async function start_and_wait(run_command, check, lock) {
 }
 
 /**
- * Makes sure the shared local Syntax Auth is running. Never throws. With `can_start: false` (a
- * site's dev server on Linux, or where nobody is at the Mac's screen) it only checks, and says how
- * to start it. Every command it runs has a time limit (see STARTUP_LIMITS); one that stalls is
- * stopped, and the app runs signed out with a message naming it. It opens Docker Desktop or OrbStack
- * only with a person at the Mac's screen: never from an agent shell, over SSH, in CI, under a test
- * runner, or outside the desktop session (unless SYNTAX_DEV_SETUP_DIALOGS=allow, at the screen), so
- * no dialog of Docker's own appears there. Starting the container when Docker runs shows none.
+ * Makes sure the shared local Syntax Auth is running, on macOS or Linux. Never throws. With
+ * `can_start: false` it only checks, and says how to start it. Every command it runs has a time
+ * limit (see STARTUP_LIMITS); one that stalls is stopped, and the app runs signed out with a message
+ * naming it. It opens Docker Desktop or OrbStack only with a person at the Mac's screen: never from
+ * an agent shell, over SSH, in CI, under a test runner, or outside the desktop session (unless
+ * SYNTAX_DEV_SETUP_DIALOGS=allow, at the screen), so no dialog of Docker's own appears there.
+ * Starting the container when Docker already runs shows none, so that happens anywhere.
  * @param {EnsureOptions} [options]
  */
 export async function ensure_syntax_auth({
@@ -153,7 +154,7 @@ export async function ensure_syntax_auth({
 		if (!(await check())) {
 			if (!can_start) {
 				report(
-					`Running signed out: local Syntax Auth isn't running, and this dev server starts it only on a Mac with a person at its screen. Run \`pnpm exec syntax-auth-local\` to start it, then restart dev.`
+					`Running signed out: local Syntax Auth isn't running, and this start only checks. Run \`pnpm exec syntax-auth-local\` to start it, then restart dev.`
 				);
 				return;
 			}
@@ -182,10 +183,15 @@ export async function ensure_syntax_auth({
 }
 
 /**
- * Vite plugin: whenever the dev server starts, ensures local Syntax Auth without delaying it, and,
- * given a site name, sets up that site's https://*.syntax.test name (see README.md).
+ * Vite plugin: whenever the dev server starts, ensures local Syntax Auth without delaying it, and
+ * serves sign-in, sign-out, and any `routes` through the app's own address (see CONSUMING_AUTH.md).
  * @param {import('./plugin.js').SyntaxAuthOptions} [options]
  */
 export function syntax_auth(options = {}) {
-	return create_plugin(options, { ...default_setup_deps(), ensure_syntax_auth });
+	return create_plugin(options, {
+		env: process.env,
+		ensure_syntax_auth,
+		call_local_auth: create_local_auth_caller(),
+		warn
+	});
 }

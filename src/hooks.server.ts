@@ -1,8 +1,11 @@
 import { building, dev } from '$app/environment';
 import { create_auth } from '$lib/server/auth';
 import { refuse_cross_site_form } from '$lib/server/cross_site_forms';
-import { for_local_site, get_auth_environment } from '$lib/server/env';
-import { get_local_site, local_host_refusal, name_refused_origin } from '$lib/utils/local_hosts';
+import { for_request } from '$lib/server/dev_proxy';
+import { get_auth_environment } from '$lib/server/env';
+import { answer_local_auth } from '$lib/server/local_session_cookies';
+import { local_host_refusal, name_refused_origin } from '$lib/utils/local_hosts';
+import { is_loopback_hostname } from '$lib/utils/loopback';
 import { svelteKitHandler } from 'better-auth/svelte-kit';
 
 import type { Handle } from '@sveltejs/kit';
@@ -27,10 +30,8 @@ export const handle: Handle = async ({ event, resolve }) => {
 	const is_auth_path = event.url.pathname.startsWith('/api/auth/');
 
 	if (environment.is_local_development) {
-		const site = get_local_site(event.url.hostname, event.request.headers.get('cookie'));
-
 		// Local mode has a passwordless developer account, so it must never answer a real hostname.
-		if (!site) {
+		if (!is_loopback_hostname(event.url.hostname)) {
 			const loopback_origin = new URL(environment.BETTER_AUTH_URL).origin;
 			return new Response(local_host_refusal(event.url.hostname, loopback_origin), {
 				status: 403,
@@ -38,14 +39,20 @@ export const handle: Handle = async ({ event, resolve }) => {
 			});
 		}
 
-		environment = for_local_site(environment, site);
+		// Per request: the cookie kind and the origin an app's development proxy vouched for
+		// (src/lib/server/dev_proxy.ts). Malformed or mismatched proxy metadata is refused.
+		const local = for_request(environment, event.request);
+		if ('refusal' in local) return local.refusal;
+		environment = local.environment;
 
-		// Behind the local HTTPS proxy, and on app servers' calls through localhost, the request's
-		// origin differs from https://auth.syntax.test, so svelteKitHandler wouldn't recognize these
-		// paths. Better Auth handles them before the getSession below, which would otherwise refresh
-		// the session first and keep get-session's refreshed cookie from reaching the app.
-		if (site === 'syntax_test' && is_auth_path) {
-			const response = await create_auth(environment).handler(event.request);
+		// The auth API, as svelteKitHandler below would route it, but before the getSession below,
+		// which would refresh the session first and keep get-session's refreshed cookie from
+		// reaching the app. Sign-out ends every session cookie the browser sent, and a sign-in
+		// expires an older one read before its own (src/lib/server/local_session_cookies.ts).
+		if (is_auth_path && event.url.origin === new URL(environment.BETTER_AUTH_URL).origin) {
+			const response = await answer_local_auth(environment, event.request, (env, request) =>
+				create_auth(env).handler(request)
+			);
 			return name_refused_origin(response, event.request, true);
 		}
 	}

@@ -1,5 +1,5 @@
-// Docker, process, and locking internals shared by the dev-server entry (index.js), the .syntax.test
-// setup (setup.js), and the detached updater.
+// Docker, process, and locking internals shared by the dev-server entry (index.js), Syntax Auth's
+// own `pnpm dev` (scripts/local_server.js), and the detached updater.
 import { spawn } from 'node:child_process';
 import { access, constants, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -11,11 +11,9 @@ export const SYNTAX_AUTH_LOCAL_ORIGIN = `http://localhost:${SYNTAX_AUTH_LOCAL_PO
 export const CONTAINER_NAME = 'syntax-auth';
 export const IMAGE = 'ghcr.io/syntaxfm/auth-local:latest';
 
-// Holding one of these ports is a machine-wide lock: 37961 for changing a container, 37962 for the
-// .syntax.test setup. The OS releases it the moment the holder exits, so a crashed or interrupted
-// process can never leave a stale lock.
+// Holding this port is a machine-wide lock for changing a container. The OS releases it the moment
+// the holder exits, so a crashed or interrupted process can never leave a stale lock.
 export const CONTAINER_LOCK_PORT = 37961;
-export const SETUP_LOCK_PORT = 37962;
 const LOCK_TIMEOUT_MS = 300_000;
 const DOCKER_START_TIMEOUT_MS = 120_000;
 const VOLUME_NAME = 'syntax-auth';
@@ -61,7 +59,7 @@ export function describe_command(command, args) {
  * @param {number} timeout_ms
  */
 export function stall_message(command, args, timeout_ms) {
-	return `\`${describe_command(command, args)}\` didn't finish within ${describe_limit(timeout_ms)}, so setup stopped it`;
+	return `\`${describe_command(command, args)}\` didn't finish within ${describe_limit(timeout_ms)}, so it was stopped`;
 }
 
 /** @param {number} ms @returns {string} like "2 minutes", or as describe_limit gives it */
@@ -94,8 +92,8 @@ const READ_ONLY_SECURITY = new Set(['verify-cert', 'find-certificate']);
 
 /**
  * Why `command` must not run under a test runner, or null. Tests use stand-ins for every command
- * that can show a dialog or change this computer (the hosts dialog, the keychain, sudo, opening an
- * app, docker), so a test that reaches the real one is a bug: it fails instead of acting.
+ * that can show a dialog or change this computer (osascript, the keychain, sudo, opening an app,
+ * docker), so a test that reaches the real one is a bug: it fails instead of acting.
  * @param {string} command
  * @param {string[]} args
  * @param {NodeJS.ProcessEnv} env
@@ -402,104 +400,6 @@ export async function pull_image(run_command = run) {
 }
 
 /**
- * @typedef {{ proto: string, address: string, process: string, pid: number }} Listener
- */
-
-/**
- * Every TCP listener on `port`, from macOS's `netstat -anv`, which (unlike `lsof`) also shows
- * processes owned by other users, such as a Caddy run by root. Columns are found by the header,
- * which differs between macOS versions: newer ones name the process (`process:pid`, where the name
- * may contain spaces), older ones give only the `pid`, whose name comes from `ps`. A failed or
- * unreadable netstat gives `error`, never an empty list, so a busy port is never taken for free.
- * @param {number} port
- * @param {Run} [run_command]
- * @returns {Promise<{ listeners: Listener[] } | { error: string }>}
- */
-export async function find_port_listeners(port, run_command = run) {
-	const result = await run_command('netstat', ['-anv', '-p', 'tcp']);
-	if (result.code !== 0) {
-		return {
-			error: `\`netstat -anv -p tcp\` failed: ${first_line(result.stderr) || `exit code ${result.code}`}`
-		};
-	}
-	const lines = result.stdout.split('\n');
-	const header_index = lines.findIndex((line) => /^Proto\s/.test(line));
-	const header = (lines[header_index] ?? '')
-		.replace('Local Address', 'Local_Address')
-		.replace('Foreign Address', 'Foreign_Address')
-		.trim()
-		.split(/\s+/);
-	const columns = {
-		proto: header.indexOf('Proto'),
-		local: header.indexOf('Local_Address'),
-		state: header.indexOf('(state)'),
-		named: header.indexOf('process:pid'),
-		pid: header.indexOf('pid')
-	};
-	if (
-		header_index === -1 ||
-		columns.proto !== 0 ||
-		columns.local === -1 ||
-		columns.state === -1 ||
-		(columns.named === -1 && columns.pid === -1)
-	) {
-		return {
-			error: `\`netstat -anv -p tcp\` printed a format setup can't read (no "Proto … Local Address … process:pid" or "pid" header)`
-		};
-	}
-
-	/** @type {Listener[]} */
-	const listeners = [];
-	for (const line of lines.slice(header_index + 1)) {
-		const fields = line.trim().split(/\s+/);
-		if (!/^tcp(?:4|6|46)$/.test(fields[0] ?? '') || fields[columns.state] !== 'LISTEN') continue;
-		const local = fields[columns.local] ?? '';
-		const dot = local.lastIndexOf('.');
-		if (Number(local.slice(dot + 1)) !== port) continue;
-
-		let name = '';
-		/** @type {number} */
-		let pid;
-		if (columns.named !== -1) {
-			// The process name may contain spaces: it runs until the field that ends in ":<pid>".
-			const end = fields.findIndex((field, i) => i >= columns.named && /:\d+$/.test(field));
-			const joined = end === -1 ? '' : fields.slice(columns.named, end + 1).join(' ');
-			name = joined.replace(/:\d+$/, '');
-			pid = Number(joined.match(/:(\d+)$/)?.[1]);
-		} else {
-			pid = Number(fields[columns.pid]);
-		}
-		if (!Number.isInteger(pid) || pid <= 0) {
-			return {
-				error: `\`netstat -anv -p tcp\` printed a listener on port ${port} without a process id`
-			};
-		}
-		if (!name) {
-			const command = await run_command('ps', ['-o', 'comm=', '-p', String(pid)]);
-			name = command.code === 0 ? basename(command.stdout.trim()) : '';
-		}
-		listeners.push({
-			proto: fields[0],
-			address: local.slice(0, dot),
-			process: name || 'a program',
-			pid
-		});
-	}
-	return { listeners };
-}
-
-/**
- * @param {{ process: string, pid: number }[]} listeners
- * @returns {string} like "nginx (pid 123)" or "nginx (pid 123) and caddy (pid 456)"
- */
-export function describe_listeners(listeners) {
-	const names = [
-		...new Set(listeners.map((listener) => `${listener.process} (pid ${listener.pid})`))
-	];
-	return names.join(' and ');
-}
-
-/**
  * @param {Run} [run_command]
  * @returns {Promise<string | null>} the program listening on the local port, like "python3 (pid 123)"
  */
@@ -577,12 +477,12 @@ function acquire_lock(port) {
 
 		const attempt = () => {
 			const server = createServer();
-			server.once('error', (error) => {
+			server.once('error', (/** @type {NodeJS.ErrnoException} */ error) => {
 				if (error.code !== 'EADDRINUSE') return reject(error);
 				if (Date.now() > deadline) {
 					return reject(
 						new Error(
-							'Timed out after 5 minutes waiting for another Syntax dev server to finish its setup'
+							'Timed out after 5 minutes waiting for another Syntax dev server to finish starting local Syntax Auth'
 						)
 					);
 				}
@@ -645,7 +545,7 @@ async function is_docker_running(run_command) {
  * @property {number} poll_ms
  * @property {() => Promise<string | null>} why_not_open null when the Docker app may be opened (a
  *   person is at this Mac's screen); otherwise where this run started, like "from an agent shell
- *   (PI_CODING_AGENT)" (see setup.js's check_presence). Docker Desktop's first run and its
+ *   (PI_CODING_AGENT)" (see presence.js). Docker Desktop's first run and its
  *   privileged helper can show dialogs, so nothing opens it where nobody can answer them.
  */
 /** @type {Omit<DockerStartOptions, 'why_not_open'>} */

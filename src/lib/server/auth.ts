@@ -1,14 +1,41 @@
 import { oauthProvider } from '@better-auth/oauth-provider';
 import { drizzleAdapter } from '@better-auth/drizzle-adapter';
-import { betterAuth } from 'better-auth';
+import { betterAuth, type BetterAuthOptions } from 'better-auth';
 import { jwt } from 'better-auth/plugins';
 import { drizzle } from 'drizzle-orm/d1';
 
-import { SYNTAX_TEST_TRUSTED_ORIGINS } from '../utils/local_hosts';
 import * as schema from './db/schema';
 import type { AuthEnvironment } from './env';
 import { LOCAL_DEVELOPER } from './local_developer';
 import { get_oauth_valid_audiences } from './oauth_audiences';
+
+// Locally: Syntax Auth's own loopback origin, apps on any localhost port, and the one browser origin
+// the development proxy vouched for on this request (src/lib/server/dev_proxy.ts).
+export function get_trusted_origins(env: AuthEnvironment): string[] {
+	const better_auth_origin = new URL(env.BETTER_AUTH_URL).origin;
+
+	if (!env.is_local_development) {
+		return ['https://syntax.fm', 'https://*.syntax.fm', better_auth_origin];
+	}
+
+	return [
+		better_auth_origin,
+		'http://localhost:*',
+		'http://127.0.0.1:*',
+		...(env.trusted_dev_origin ? [env.trusted_dev_origin] : [])
+	];
+}
+
+// Deployed: the shared `.syntax.fm` cookie. Locally: a host-only cookie, named and marked `__Secure-`
+// for a browser on https. It keeps that name and attribute on app servers' http://localhost calls,
+// because Better Auth reads only the configured name.
+export function get_cookie_options(env: AuthEnvironment): BetterAuthOptions['advanced'] {
+	if (env.is_local_development) return { useSecureCookies: env.use_secure_cookies === true };
+
+	return env.AUTH_COOKIE_DOMAIN
+		? { crossSubDomainCookies: { enabled: true, domain: env.AUTH_COOKIE_DOMAIN } }
+		: undefined;
+}
 
 export function create_auth(env: AuthEnvironment) {
 	const database = drizzle(env.DB, { schema });
@@ -24,26 +51,8 @@ export function create_auth(env: AuthEnvironment) {
 			schema
 		}),
 		disabledPaths: ['/token'],
-		trustedOrigins: env.is_local_development
-			? [
-					better_auth_origin,
-					'http://localhost:*',
-					'http://127.0.0.1:*',
-					...SYNTAX_TEST_TRUSTED_ORIGINS
-				]
-			: ['https://syntax.fm', 'https://*.syntax.fm', better_auth_origin],
-		advanced: env.AUTH_COOKIE_DOMAIN
-			? {
-					// Locally the .syntax.test cookie must keep its `__Secure-` name and `Secure` attribute
-					// when app servers call over http://localhost, because Better Auth reads only the
-					// configured name. Deployed URLs are https, so they get both without this.
-					...(env.is_local_development ? { useSecureCookies: true } : {}),
-					crossSubDomainCookies: {
-						enabled: true,
-						domain: env.AUTH_COOKIE_DOMAIN
-					}
-				}
-			: undefined,
+		trustedOrigins: get_trusted_origins(env),
+		advanced: get_cookie_options(env),
 		// Locally, email/password backs the one-click developer sign-in instead of GitHub.
 		...(env.is_local_development
 			? {

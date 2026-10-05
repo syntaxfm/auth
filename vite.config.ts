@@ -1,10 +1,7 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig, type Connect, type Plugin } from 'vite';
 
-import { syntax_auth } from './packages/auth-local/index.js';
-
 import {
-	SYNTAX_TEST_AUTH_HOSTNAME,
 	get_host_header_hostname,
 	is_local_hostname,
 	local_host_refusal
@@ -39,14 +36,9 @@ export default defineConfig({
 		// IPv4 like the Docker container, so the two can never both hold the port.
 		host: '127.0.0.1',
 		port: 37960,
-		strictPort: true,
-		// The local HTTPS proxy forwards this name to Syntax Auth.
-		allowedHosts: [SYNTAX_TEST_AUTH_HOSTNAME]
+		strictPort: true
 	},
-	preview: {
-		allowedHosts: [SYNTAX_TEST_AUTH_HOSTNAME]
-	},
-	// On `pnpm dev`, sets up https://auth.syntax.test (hosts file, Caddy route, certificate trust).
-	// scripts/local_server.js already stands in for the container, so the plugin skips it.
-	plugins: [refuse_other_hosts(), syntax_auth({ name: 'auth' }), sveltekit()]
+	// Syntax Auth is the shared local Syntax Auth itself, so it needs neither the container nor the
+	// development proxy from packages/auth-local; scripts/local_server.js stands in for the container.
+	plugins: [refuse_other_hosts(), sveltekit()]
 });

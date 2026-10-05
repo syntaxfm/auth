@@ -93,21 +93,29 @@ pnpm dev
 D1, and serves `http://localhost:37960`. `pnpm preview` does the same with a production build.
 Both run through `scripts/local_server.js`: however they stop, they stop every process they
 started and start the container again, so other Syntax apps keep signing in. Neither needs
-secrets: the Cloudflare adapter reads the committed `local` Wrangler environment, which has a
-loopback URL, no shared cookie domain, and a local-only D1 database under the ignored `.wrangler/`
-directory. In that mode Syntax Auth replaces GitHub with a one-click local developer account (user
-ID `local-developer`) and answers only `localhost` and `auth.syntax.test`, the local HTTPS name
-that apps on `https://syntax.test` and `https://*.syntax.test` send browsers to. On
-`auth.syntax.test`, and on app servers' `localhost` calls that forward its cookie, sessions use the
-shared `.syntax.test` cookie described in `CONSUMING_AUTH.md`. Under `vite dev` (`pnpm dev`) and
-`vite preview` (the Docker image), a plugin in `vite.config.ts` answers every request for any other
-host, including `/api/health` and built files, with a plain-text 403 naming the host and the two
-addresses to use, before Vite's own host check or file serving. `src/hooks.server.ts` refuses
-other hosts the same way for every page and auth route, so `wrangler dev` (`pnpm preview`), which
-skips the Vite plugin, still refuses them there; it serves `/api/health` and built files to any
-host. In local mode, a request from an origin local Syntax Auth doesn't trust gets Better Auth's
-403 `INVALID_ORIGIN` with a message naming the origin and the origins it accepts.
-Deploys use the top-level configuration and never enable local mode.
+secrets, and neither changes anything else on the machine: the Cloudflare adapter reads the
+committed `local` Wrangler environment, which has a loopback URL, no shared cookie domain, and a
+local-only D1 database under the ignored `.wrangler/` directory. In that mode Syntax Auth replaces
+GitHub with a one-click local developer account (user ID `local-developer`) and answers only
+`localhost`, `127.0.0.1`, and `[::1]`. Under `vite dev` (`pnpm dev`) and `vite preview` (the Docker
+image), a plugin in `vite.config.ts` answers every request for any other host, including
+`/api/health` and built files, with a plain-text 403 naming the host and the address to use,
+before Vite's own host check or file serving. `src/hooks.server.ts` refuses other hosts the same
+way for every page and auth route, so `wrangler dev` (`pnpm preview`), which skips the Vite
+plugin, still refuses them there; it serves `/api/health` and built files to any host. In local
+mode, a request from an origin local Syntax Auth doesn't trust gets Better Auth's 403
+`INVALID_ORIGIN` with a message naming the origin and the origins it accepts. Deploys use the
+top-level configuration and never enable local mode.
+
+Browsers on other addresses (a LAN or Tailscale address, or a developer's own HTTPS name) never
+reach this server: they sign in through their app's development proxy from `packages/auth-local`,
+which calls it on loopback (see `CONSUMING_AUTH.md`, "Local development"). Per request,
+`src/hooks.server.ts` picks host-only cookies, `__Secure-` ones for a browser on https, from the
+session cookie's name or from the proxy's checked `x-syntax-auth-dev-origin` header
+(`src/lib/server/dev_proxy.ts`), and serves local `/api/auth/*` calls before its own session
+lookup, so a refreshed cookie always reaches the app server that asked. A local sign-out ends the
+session of each session cookie the request carries, plain and `__Secure-`, and a sign-in on http
+expires a `__Secure-` one that would be read before it (`src/lib/server/local_session_cookies.ts`).
 
 Consumer apps run the same service from the private `ghcr.io/syntaxfm/auth-local` Docker image,
 which `.github/workflows/local-image.yml` publishes from `main`. The image serves a production
@@ -117,31 +125,19 @@ syntaxfm members, pulls it with their GitHub CLI login without storing the token
 `CONSUMING_AUTH.md`. The port lives in `packages/auth-local/container.js`,
 `vite.config.ts`, and the `local` and `oauth-registration` envs in `wrangler.jsonc`.
 
-### https://auth.syntax.test
+No dev server and no `syntax-auth-local` opens Docker Desktop or OrbStack, whose first run and
+privileged helper can show dialogs, from an AI coding agent's shell (`CLAUDECODE` or
+`PI_CODING_AGENT` set), over SSH (`SSH_CONNECTION` or `SSH_TTY`), in CI (`CI`), under a test runner
+(`NODE_TEST_CONTEXT` or `VITEST`), or outside the Mac's desktop session; if Docker isn't running,
+the app runs signed out and says to start Docker, then restart dev. Each of those variables counts
+when set at all, even to an empty string, `0`, or `false`. When Docker already runs, the local
+Syntax Auth container still starts. `SYNTAX_DEV_SETUP_DIALOGS=allow` at the Mac's screen lets an
+agent's run open Docker too; it never works over SSH, in CI, or under a test runner.
 
-On macOS, `pnpm dev` also makes `https://auth.syntax.test` answer, through the same plugin
-(`syntax_auth({ name: 'auth' })` in `vite.config.ts`), as every Syntax app's dev server does for
-its own name. `CONSUMING_AUTH.md` describes each step; the first start asks for your password once
-(for `/etc/hosts`) and one approval (to trust Caddy's local root), and later starts ask nothing.
-Syntax Auth's own dev server never redirects `localhost`, because apps call it there.
+### Undoing the old `.syntax.test` setup
 
-Setup never shows a dialog from an AI coding agent's shell (`CLAUDECODE` or `PI_CODING_AGENT`
-set), over SSH (`SSH_CONNECTION` or `SSH_TTY`), in CI (`CI`), under a test runner
-(`NODE_TEST_CONTEXT` or `VITEST`), or outside the Mac's desktop session. It then changes nothing,
-says why on its first line, and prints each fix, such as running
-`node packages/auth-local/bin.js setup auth` in Terminal at the Mac's own screen. To let an
-agent's run show the dialogs while you watch the screen, start it with
-`SYNTAX_DEV_SETUP_DIALOGS=allow` (for example `SYNTAX_DEV_SETUP_DIALOGS=allow pnpm dev`); the
-switch never works over SSH, in CI, or under a test runner. Each of those variables counts when
-set at all, even to an empty string, `0`, or `false`.
-
-In the same cases no dev server (with a name or without) and no `syntax-auth-local` opens
-Docker Desktop or OrbStack, whose first run and privileged helper can show dialogs; if Docker
-isn't running, the app runs signed out and says to start Docker, then restart dev. When Docker
-already runs, the local Syntax Auth container still starts. `SYNTAX_DEV_SETUP_DIALOGS=allow` at
-the Mac's screen lets it open Docker too.
-
-Setup leaves everything in place when dev stops. To undo it:
+Earlier versions of the plugin set up `https://*.syntax.test` names on macOS. Nothing does that
+any more, and nothing removes what it added. To remove it by hand:
 
 ```sh
 # The routes and certificate policy, from whichever Caddy got them:
@@ -171,14 +167,14 @@ pnpm d1:migration:create <migration-name>
 ```
 
 `pnpm test` runs the unit tests, an integration test that builds the app, serves it with
-`vite preview` on a free port with a temporary D1, and signs in on `localhost` and
-`auth.syntax.test`, and the `packages/auth-local` tests (also `pnpm --dir packages/auth-local
-test`). Those run setup against stand-ins for Caddy, docker, the password dialog (the real hosts
-script edits a temporary file), and macOS's `security`. None of them touches port 37960, the
-container, `.wrangler/state`, `/etc/hosts`, the keychain, or ports 80, 443, and 2019. Under a test
-runner, setup shows no dialog, and the package refuses to run `osascript`, `sudo`, `open`,
-`docker`, or a `security` command that changes the keychain, so a test that misses a stand-in
-fails instead of acting on your Mac.
+`vite preview` on a free port with a temporary D1, and signs in on `localhost` and, through the
+real development proxy from `packages/auth-local` in front of it, as a browser on a LAN address
+and on an https name, and the `packages/auth-local` tests (also `pnpm --dir packages/auth-local
+test`). Those run the proxy against stand-ins for local Syntax Auth, routed servers, and broken
+upstreams on free loopback ports, and the container start against a stand-in `docker`. None of
+them touches port 37960, the container, or `.wrangler/state`. Under a test runner the package
+refuses to run `osascript`, `sudo`, `open`, `docker`, or a `security` command that changes the
+keychain, so a test that misses a stand-in fails instead of acting on your machine.
 
 `drizzle.config.ts` is intentionally generation-only: it declares the SQLite schema and migrations
 directory without inventing a local SQLite URL or storing Cloudflare credentials. Apply migrations

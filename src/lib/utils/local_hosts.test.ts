@@ -5,38 +5,26 @@ import { test } from 'node:test';
 
 import {
 	get_host_header_hostname,
-	get_local_site,
+	has_cookie,
 	is_local_hostname,
 	is_syntax_test_app_url,
+	local_host_refusal,
 	name_refused_origin
 } from './local_hosts';
 
-test('a loopback request is a .syntax.test request only with the exact secure session cookie', () => {
-	const site = (cookie_header: string | null) => get_local_site('localhost', cookie_header);
+test('a cookie is found only by its exact name', () => {
+	const name = '__Secure-better-auth.session_token';
 
-	assert.equal(site(null), 'loopback');
-	assert.equal(site('better-auth.session_token=a.b'), 'loopback');
-	assert.equal(site('x__Secure-better-auth.session_token=a.b'), 'loopback');
-	assert.equal(site('__Secure-better-auth.session_token_old=a.b'), 'loopback');
-	assert.equal(site('theme=__Secure-better-auth.session_token'), 'loopback');
-	assert.equal(site('theme=dark;__Secure-better-auth.session_token=a.b'), 'syntax_test');
+	assert.equal(has_cookie(null, name), false);
+	assert.equal(has_cookie('better-auth.session_token=a.b', name), false);
+	assert.equal(has_cookie('x__Secure-better-auth.session_token=a.b', name), false);
+	assert.equal(has_cookie('__Secure-better-auth.session_token_old=a.b', name), false);
+	assert.equal(has_cookie('theme=__Secure-better-auth.session_token', name), false);
+	assert.equal(has_cookie('theme=dark;__Secure-better-auth.session_token=a.b', name), true);
 	assert.equal(
-		site('better-auth.session_token=a.b; __Secure-better-auth.session_token=c.d'),
-		'syntax_test'
+		has_cookie('better-auth.session_token=a.b; __Secure-better-auth.session_token=c', name),
+		true
 	);
-	assert.equal(get_local_site('[::1]', '__Secure-better-auth.session_token=a.b'), 'syntax_test');
-	assert.equal(get_local_site('127.0.0.1', null), 'loopback');
-});
-
-test('only auth.syntax.test and loopback names are local sites, whatever the cookie', () => {
-	const cookie = '__Secure-better-auth.session_token=a.b';
-
-	assert.equal(get_local_site('auth.syntax.test', null), 'syntax_test');
-	assert.equal(get_local_site('auth.syntax.test.', cookie), null);
-	assert.equal(get_local_site('syntax.test', cookie), null);
-	assert.equal(get_local_site('lab.syntax.test', cookie), null);
-	assert.equal(get_local_site('auth.syntax.test.example.com', cookie), null);
-	assert.equal(get_local_site('localhost.example.com', cookie), null);
 });
 
 test('app URLs must be https on syntax.test or a subdomain, with no credentials', () => {
@@ -50,22 +38,33 @@ test('app URLs must be https on syntax.test or a subdomain, with no credentials'
 	assert.equal(accepts('wss://lab.syntax.test/'), false);
 });
 
-test('Host headers resolve to the hostname SvelteKit sees, and only local names pass', () => {
+test('Host headers resolve to the hostname SvelteKit sees, and only loopback names pass', () => {
 	const passes = (host: string | undefined) => is_local_hostname(get_host_header_hostname(host));
 
-	assert.equal(get_host_header_hostname('AUTH.Syntax.Test:443'), 'auth.syntax.test');
+	assert.equal(get_host_header_hostname('LOCALHOST:37960'), 'localhost');
 	assert.equal(get_host_header_hostname('[::1]:37960'), '[::1]');
 	assert.equal(get_host_header_hostname(undefined), '');
 	assert.equal(get_host_header_hostname('a b'), 'a b');
 	assert.equal(passes('localhost'), true);
 	assert.equal(passes('127.0.0.1:37960'), true);
 	assert.equal(passes('[::1]'), true);
-	assert.equal(passes('auth.syntax.test'), true);
-	assert.equal(passes(undefined), false);
-	assert.equal(passes('evil.localhost:37960'), false);
-	assert.equal(passes('10.0.0.1'), false);
-	assert.equal(passes('localhost@evil.example'), false);
-	assert.equal(passes('auth.syntax.test.'), false);
+	for (const host of [
+		undefined,
+		'auth.syntax.test',
+		'lab.syntax.test',
+		'evil.localhost:37960',
+		'10.0.0.1',
+		'192.168.1.20:37960',
+		'100.101.102.103',
+		'localhost@evil.example',
+		'localhost.example.com'
+	]) {
+		assert.equal(passes(host), false, String(host));
+	}
+	assert.equal(
+		local_host_refusal('lab.example.dev', 'http://localhost:37960'),
+		'Local Syntax Auth answers only localhost, 127.0.0.1, and [::1], so it refused this request for "lab.example.dev". Open http://localhost:37960 instead, or sign in through your app\'s own /__syntax_auth/sign-in.'
+	);
 });
 
 const INVALID_ORIGIN_BODY = { message: 'Invalid origin', code: 'INVALID_ORIGIN' };
@@ -84,7 +83,7 @@ function sign_out_request(headers: Record<string, string>) {
 test('locally, a refused origin is named with the addresses local Syntax Auth accepts', async () => {
 	const reply = await name_refused_origin(
 		better_auth_reply(INVALID_ORIGIN_BODY),
-		sign_out_request({ origin: 'https://syntax.test.example' }),
+		sign_out_request({ origin: 'https://lab.example.dev' }),
 		true
 	);
 
@@ -93,7 +92,7 @@ test('locally, a refused origin is named with the addresses local Syntax Auth ac
 	assert.deepEqual(await reply.json(), {
 		code: 'INVALID_ORIGIN',
 		message:
-			'Local Syntax Auth refused a request from origin "https://syntax.test.example": it accepts only http://localhost:<port>, http://127.0.0.1:<port>, https://syntax.test, and https://*.syntax.test. Open the app at one of those addresses.'
+			'Local Syntax Auth refused a request from origin "https://lab.example.dev": it accepts only http://localhost:<port> and http://127.0.0.1:<port>. Apps on any other address sign in and out through their own /__syntax_auth/ paths (@syntaxfm/auth-local).'
 	});
 
 	// Better Auth falls back to Referer when there's no Origin.

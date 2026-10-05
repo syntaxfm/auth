@@ -1,5 +1,6 @@
-import { building } from '$app/environment';
+import { building, dev } from '$app/environment';
 import { create_auth } from '$lib/server/auth';
+import { refuse_cross_site_form } from '$lib/server/cross_site_forms';
 import { for_local_site, get_auth_environment } from '$lib/server/env';
 import { get_local_site, local_host_refusal, name_refused_origin } from '$lib/utils/local_hosts';
 import { svelteKitHandler } from 'better-auth/svelte-kit';
@@ -10,6 +11,13 @@ export const handle: Handle = async ({ event, resolve }) => {
 	event.locals.session = null;
 	event.locals.user = null;
 	event.locals.is_local_development = false;
+
+	// SvelteKit's own cross-site form check, run first as SvelteKit ran it (and, like it, only in
+	// built servers), except on the endpoints native OAuth clients post to.
+	if (!dev && !building) {
+		const refusal = refuse_cross_site_form(event.request, event.url);
+		if (refusal) return refusal;
+	}
 
 	if (building || event.url.pathname === '/api/health') {
 		return resolve(event);

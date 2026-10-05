@@ -523,3 +523,37 @@ test('a session made on localhost still validates and signs out', async () => {
 	assert.equal(get_cookie(reply, LOOPBACK_SESSION_COOKIE).attributes.get('max-age'), '0');
 	assert.equal((await get_session_user_id(loopback_host, loopback_cookie)).user_id, null);
 });
+
+test("native OAuth clients' token requests reach Better Auth, while other cross-site form posts are still refused", async () => {
+	const form_headers = { 'content-type': 'application/x-www-form-urlencoded' };
+
+	// No Origin, as Claude Code and pi send it. Better Auth answers (an unknown client here),
+	// not SvelteKit's cross-site refusal.
+	const token = await send('/api/auth/oauth2/token', {
+		host: loopback_host,
+		method: 'POST',
+		headers: form_headers,
+		body: 'grant_type=authorization_code&code=made-up&client_id=made-up&code_verifier=made-up'
+	});
+	assert.notEqual(token.status, 403, token.body);
+	assert.doesNotMatch(token.body, /Cross-site/);
+
+	const revoke = await send('/api/auth/oauth2/revoke', {
+		host: loopback_host,
+		method: 'POST',
+		headers: form_headers,
+		body: 'token=made-up&client_id=made-up'
+	});
+	assert.doesNotMatch(revoke.body, /Cross-site/);
+
+	for (const headers of [form_headers, { ...form_headers, origin: 'https://evil.example' }]) {
+		const consent = await send('/api/auth/oauth2/consent', {
+			host: loopback_host,
+			method: 'POST',
+			headers,
+			body: 'accept=true'
+		});
+		assert.equal(consent.status, 403);
+		assert.equal(consent.body, 'Cross-site POST form submissions are forbidden');
+	}
+});

@@ -32,6 +32,9 @@ checks. This app runs outside syntax.fm, so use the External domains (OpenID Con
 this app's existing conventions.
 ```
 
+Cross-project Auth and development setup work is tracked in Lab's Dex. This repository does not
+have a second task store for the same work; app-specific task histories stay with their apps.
+
 ## What D1 stores
 
 The initial migration creates only the Better Auth and OAuth provider tables:
@@ -107,12 +110,16 @@ mode, a request from an origin local Syntax Auth doesn't trust gets Better Auth'
 `INVALID_ORIGIN` with a message naming the origin and the origins it accepts. Deploys use the
 top-level configuration and never enable local mode.
 
-Browsers on other addresses (a LAN or Tailscale address, or a developer's own HTTPS name) never
-reach this server: they sign in through their app's development proxy from `packages/auth-local`,
-which calls it on loopback (see `CONSUMING_AUTH.md`, "Local development"). Per request,
-`src/hooks.server.ts` picks host-only cookies, `__Secure-` ones for a browser on https, from the
-session cookie's name or from the proxy's checked `x-syntax-auth-dev-origin` header
-(`src/lib/server/dev_proxy.ts`), and serves local `/api/auth/*` calls before its own session
+Browsers on other addresses (a LAN or VPN address, or a developer's own HTTPS name) never reach
+this server: they sign in through their app's development proxy from `packages/auth-local`, which
+calls it on loopback, and sign out through that proxy or through their app's own sign-out
+endpoint, whose server calls it on loopback with the browser origin it validated (see
+`CONSUMING_AUTH.md`, "Local development"). Per request, `src/hooks.server.ts` picks host-only
+cookies, `__Secure-` ones for a browser on https, from the session cookie's name or from a checked
+`x-syntax-auth-dev-origin` header sent by the proxy or an app server
+(`src/lib/server/dev_proxy.ts`); when `Origin` is present it must equal that header. A loopback
+caller may omit `Origin`, but consumer sign-out servers send both after validating the browser
+origin. The service then trusts that one origin for the request. It serves local `/api/auth/*` calls before its own session
 lookup, so a refreshed cookie always reaches the app server that asked. A local sign-out ends the
 session of each session cookie the request carries, plain and `__Secure-`, and a sign-in on http
 expires a `__Secure-` one that would be read before it (`src/lib/server/local_session_cookies.ts`).
@@ -134,24 +141,29 @@ when set at all, even to an empty string, `0`, or `false`. When Docker already r
 Syntax Auth container still starts. `SYNTAX_DEV_SETUP_DIALOGS=allow` at the Mac's screen lets an
 agent's run open Docker too; it never works over SSH, in CI, or under a test runner.
 
-### Undoing the old `.syntax.test` setup
+### The superseded `.syntax.test` setup
 
-Earlier versions of the plugin set up `https://*.syntax.test` names on macOS. Nothing does that
-any more, and nothing removes what it added. To remove it by hand:
+Earlier versions of the plugin set up `https://*.syntax.test` names on macOS. The per-app
+development proxy supersedes that architecture: nothing sets it up or relies on it any more, and
+nothing removes what it added. Current apps do not need those resources; existing routes, trust,
+and hosts entries may still affect other projects. If you remove them, do so deliberately, one
+piece at a time, after checking that the piece belongs to that setup and not to
+something else on the machine:
 
-```sh
-# The routes and certificate policy, from whichever Caddy got them:
-for id in syntax-test-auth syntax-test-lab syntax-test-website syntax-test-tls; do
-	curl -X DELETE "localhost:2019/id/$id"
-done
-# Syntax's own Caddy container, if setup started one, and its certificates:
-docker rm --force syntax-caddy && docker volume rm syntax-caddy-data syntax-caddy-config
-# Trust in Caddy's root (find its SHA-1 with the first command):
-security find-certificate -a -Z -c "Caddy Local Authority" ~/Library/Keychains/login.keychain-db
-security delete-certificate -Z <sha1> ~/Library/Keychains/login.keychain-db
-# The hosts block (/etc/hosts.syntax-test.bak holds the file from before the last change):
-sudo sed -i '' '/^# >>> syntax.test: added by Syntax dev setup/,/^# <<< syntax.test$/d' /etc/hosts
-```
+- **Caddy routes.** The setup added routes with the IDs `syntax-test-auth`, `syntax-test-lab`,
+  `syntax-test-website`, and `syntax-test-tls` to whichever Caddy was running, possibly one shared
+  with other projects. Inspect its configuration through Caddy's admin API first, and remove only
+  those IDs; never replace or delete the whole configuration.
+- **A `syntax-caddy` container** with `syntax-caddy-data` and `syntax-caddy-config` volumes, if the
+  setup started one. Confirm with `docker inspect` that it is that container before removing it.
+  The data volume holds Caddy's local certificate authority and certificates; back it up first if
+  anything else may have used it.
+- **Trust in Caddy's local root certificate.** Other Caddy installs use the same "Caddy Local
+  Authority" name, so match the trusted certificate's fingerprint against the root in the Caddy
+  data you are removing, and remove that trust only when no Caddy you still use relies on it.
+- **The hosts-file block.** Back up `/etc/hosts` first, then remove only the lines from
+  `# >>> syntax.test: added by Syntax dev setup` through `# <<< syntax.test`, and keep everything
+  else.
 
 Useful commands:
 

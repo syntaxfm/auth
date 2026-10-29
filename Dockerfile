@@ -12,4 +12,4 @@ COPY . .
 RUN pnpm build
 EXPOSE 37960
 VOLUME /app/.wrangler
-CMD ["sh", "-c", "pnpm d1:migrate:local && exec node_modules/.bin/vite preview --host 0.0.0.0 --port 37960 --strictPort"]
+CMD ["sh", "-c", "pnpm d1:migrate:local && pnpm oauth:seed-local && exec node_modules/.bin/vite preview --host 0.0.0.0 --port 37960 --strictPort"]

@@ -18,7 +18,7 @@ import {
 } from '../packages/auth-local/container.js';
 
 const SERVER_COMMANDS = {
-	dev: 'pnpm d1:migrate:local && exec vite dev',
+	dev: 'pnpm d1:migrate:local && pnpm oauth:seed-local && exec vite dev',
 	preview: `pnpm build && exec wrangler dev --env local --ip 127.0.0.1 --port ${SYNTAX_AUTH_LOCAL_PORT}`
 };
 // Vite restarts its server within about a second when its config changes, so only a longer

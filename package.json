@@ -17,7 +17,8 @@
 		"d1:migrate:local": "wrangler d1 migrations apply syntax-auth --local --env local",
 		"d1:migrate:remote": "wrangler d1 migrations apply syntax-auth --remote",
 		"deploy": "pnpm build && wrangler deploy --env=\"\"",
-		"oauth:register": "tsx scripts/register_oauth_client.ts"
+		"oauth:register": "tsx scripts/register_oauth_client.ts",
+		"oauth:seed-local": "tsx scripts/seed_local_oauth_clients.ts"
 	},
 	"dependencies": {
 		"@better-auth/drizzle-adapter": "1.6.23",

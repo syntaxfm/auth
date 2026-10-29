@@ -379,6 +379,13 @@ instead. A request from an origin it doesn't trust gets a 403 with code `INVALID
 message naming that origin and the origins it accepts. Its sessions are meaningless to production.
 The container publishes its port on `127.0.0.1` only.
 
+Local mode also lets a member's own agent (Claude Code, pi) sign in to Syntax Lab's local MCP
+endpoint as the local developer. It issues access tokens for `http://localhost:1337/mcp`, and it
+seeds one public OAuth client, `syntax-lab-mcp-local` (`pnpm oauth:seed-local`, run on every start
+of the container and of `pnpm dev`), with the same redirects as production's Syntax Lab MCP
+client. Deployed Syntax Auth has neither, and production refuses its tokens: their issuer and keys
+are local.
+
 ### Leaving the old `.syntax.test` setup
 
 Earlier versions set up `https://syntax.test`, `https://lab.syntax.test`, and

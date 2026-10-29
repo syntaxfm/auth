@@ -91,7 +91,7 @@ export function create_auth(env: AuthEnvironment) {
 				allowDynamicClientRegistration: false,
 				allowUnauthenticatedClientRegistration: false,
 				// Without this, Better Auth accepts only its own base URL as a token `resource`.
-				validAudiences: get_oauth_valid_audiences(better_auth_origin),
+				validAudiences: get_oauth_valid_audiences(better_auth_origin, env.is_local_development),
 				silenceWarnings: {
 					oauthAuthServerConfig: true
 				}

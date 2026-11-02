@@ -60,9 +60,13 @@ export const handle: Handle = async ({ event, resolve }) => {
 	const auth = create_auth(environment);
 	event.locals.auth = auth;
 	event.locals.is_local_development = environment.is_local_development;
-	const session = await auth.api.getSession({
-		headers: event.request.headers
-	});
+	// The auth API checks a session itself, so reading one here would make every app's get-session do
+	// it twice, and take the refresh whose cookie that answer must carry. Only pages read these.
+	const session = is_auth_path
+		? null
+		: await auth.api.getSession({
+				headers: event.request.headers
+			});
 
 	if (session) {
 		event.locals.session = session.session;

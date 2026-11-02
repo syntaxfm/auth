@@ -18,6 +18,10 @@ In server middleware or a server hook, for every request that needs authenticati
    `Cookie` header.
 3. Disable caching with the runtime's `cache: 'no-store'` option and a `Cache-Control: no-store`
    request header. Never cache the response in a CDN, shared cache, or process-global variable.
+   One exception so far, decided 2026-11-02: Syntax Lab's GET requests reuse an answer for up to 60
+   seconds, under a hash of the whole `Cookie` header, so a sign-out on another device can take that
+   long to reach its reads. Its writes and realtime access still ask on every request. Any other
+   app needs its own decision.
 4. Treat a `null`, malformed, or unsuccessful response as signed out.
 5. Copy only the allowed fields below into the framework's per-request context (`locals`, request
    state, or its equivalent).

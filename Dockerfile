@@ -2,6 +2,8 @@
 # Never deploy this image; production runs on Cloudflare Workers.
 FROM node:22-slim
 WORKDIR /app
+# node:22-slim ships without CA certificates, and workerd refuses to start without them.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile

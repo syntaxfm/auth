@@ -88,8 +88,12 @@ export function create_auth(env: AuthEnvironment) {
 				loginPage: '/sign-in',
 				consentPage: '/consent',
 				scopes: ['openid', 'profile', 'email', 'offline_access'],
-				allowDynamicClientRegistration: false,
-				allowUnauthenticatedClientRegistration: false,
+				// MCP clients such as Tasty register themselves (RFC 7591), as with Linear's and Notion's
+				// MCP servers. Better Auth makes every unauthenticated registration a public client (no
+				// secret, PKCE required, no client_credentials) and refuses `skip_consent`, so each
+				// person still sees the consent page, which names where the request returns.
+				allowDynamicClientRegistration: true,
+				allowUnauthenticatedClientRegistration: true,
 				// Without this, Better Auth accepts only its own base URL as a token `resource`.
 				validAudiences: get_oauth_valid_audiences(better_auth_origin, env.is_local_development),
 				silenceWarnings: {

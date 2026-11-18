@@ -388,7 +388,7 @@ endpoint as the local developer. It issues access tokens for `http://localhost:1
 seeds one public OAuth client, `syntax-lab-mcp-local` (`pnpm oauth:seed-local`, run on every start
 of the container and of `pnpm dev`), with the same redirects as production's Syntax Lab MCP
 client. Deployed Syntax Auth has neither, and production refuses its tokens: their issuer and keys
-are local.
+are local. It also issues tokens for the website's local MCP endpoint, `http://localhost:5740/mcp`.
 
 ### Leaving the old `.syntax.test` setup
 
@@ -415,6 +415,18 @@ token in a host-only HttpOnly cookie and validate or introspect it centrally on 
 token out of browser JavaScript, validate issuer/audience/expiration, treat any validation or
 introspection failure as signed out, and use the OIDC `sub` as the same central user ID. Do not add a
 second user or session database. Register only the exact callback needed for the external domain.
+
+## MCP clients
+
+An MCP client, such as Tasty, Syntax's Slack agent, can register itself with dynamic client
+registration (RFC 7591) at the `registration_endpoint` in the discovery metadata, then sign each
+person in with the authorization code flow, PKCE (`S256`), and a `resource` (RFC 8707) naming the
+MCP endpoint. A client that registers without a session is always a public client: no secret, and
+no `client_credentials` grant. Every self-registered client shows the consent page, which names
+the client and the host the request returns to. Tokens are issued only for the audiences in
+`src/lib/server/oauth_audiences.ts`: Syntax Lab's MCP endpoint (`https://lab.syntax.fm/mcp`) and
+the website's (`https://beta.syntax.fm/mcp` and `https://syntax.fm/mcp`). Request
+`offline_access` for a refresh token.
 
 ## Acceptance checks
 

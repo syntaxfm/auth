@@ -198,7 +198,10 @@ Production first-party `*.syntax.fm` applications use the shared central session
 OAuth client, including during local development. Registration is only for consumers outside
 `syntax.fm` that use the OIDC flow.
 
-Dynamic and unauthenticated client registration remain disabled. The registration command loads
+MCP clients such as Tasty register themselves instead: dynamic client registration is on, without
+a session, at `/api/auth/oauth2/register`. Better Auth makes every such client public (no secret,
+PKCE required) and refuses `skip_consent`, so only this command can register a trusted client (see
+`CONSUMING_AUTH.md`, "MCP clients"). The registration command loads
 the D1 binding through Wrangler's supported platform proxy and calls Better Auth's server-only
 `auth.api.adminCreateOAuthClient` API directly. It creates a one-use Better Auth session to satisfy
 the API's authenticated-client-creation requirement, detaches the new client, and deletes the

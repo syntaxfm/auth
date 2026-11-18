@@ -6,6 +6,7 @@
 // (`wrangler dev` would be simpler, but it rewrites a same-host https Origin to http.)
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import {
 	createServer as create_http_server,
@@ -853,4 +854,169 @@ test("native OAuth clients' token requests reach Better Auth, while other cross-
 		assert.equal(consent.status, 403);
 		assert.equal(consent.body, 'Cross-site POST form submissions are forbidden');
 	}
+});
+
+// What the Cloudflare Agents SDK's MCP client (agents 0.33.0, do-oauth-client-provider.js) sends to
+// register itself, as Tasty does for each person. Better Auth 1.6.33 answers a registration with 200,
+// not RFC 7591's 201; MCP clients accept any 2xx.
+const TASTY_CALLBACK = 'https://tasty.example/mcp/callback/person-1';
+const TASTY_REGISTRATION = {
+	client_name: 'Tasty',
+	client_uri: 'https://tasty.example',
+	grant_types: ['authorization_code', 'refresh_token'],
+	redirect_uris: [TASTY_CALLBACK],
+	response_types: ['code'],
+	token_endpoint_auth_method: 'none'
+};
+const WEBSITE_LOCAL_MCP = 'http://localhost:5740/mcp';
+const MCP_SCOPES = 'openid profile email offline_access';
+
+// A server-to-server JSON post, with no Origin and no cookie.
+function post_json_from_server(path: string, body: unknown) {
+	return send(path, {
+		host: loopback_host,
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+}
+
+function post_token_form(fields: Record<string, string>) {
+	return send('/api/auth/oauth2/token', {
+		host: loopback_host,
+		method: 'POST',
+		headers: { 'content-type': 'application/x-www-form-urlencoded' },
+		body: new URLSearchParams(fields).toString()
+	});
+}
+
+function get_jwt_audiences(token: string): string[] {
+	const payload: unknown = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+	assert.ok(payload && typeof payload === 'object' && 'aud' in payload, token);
+	const { aud } = payload;
+	return Array.isArray(aud) ? aud : [String(aud)];
+}
+
+test('an MCP client registers itself as a public client and can never skip consent', async () => {
+	const metadata = await send('/.well-known/oauth-authorization-server/api/auth', {
+		host: loopback_host
+	});
+	assert.equal(metadata.status, 200, metadata.body);
+	const { registration_endpoint } = JSON.parse(metadata.body) as {
+		registration_endpoint?: string;
+	};
+	assert.equal(registration_endpoint, `${loopback_origin}/api/auth/oauth2/register`);
+
+	const registered = await post_json_from_server('/api/auth/oauth2/register', TASTY_REGISTRATION);
+	assert.equal(registered.status, 200, registered.body);
+	const client = JSON.parse(registered.body) as Record<string, unknown>;
+	assert.equal(typeof client.client_id, 'string');
+	assert.equal(client.client_secret, undefined);
+	assert.equal(client.token_endpoint_auth_method, 'none');
+	assert.equal(client.public, true);
+	assert.equal(client.skip_consent, undefined);
+
+	// An unauthenticated client asking for a secret still gets a public client.
+	const confidential = await post_json_from_server('/api/auth/oauth2/register', {
+		...TASTY_REGISTRATION,
+		token_endpoint_auth_method: 'client_secret_basic'
+	});
+	assert.equal(confidential.status, 200, confidential.body);
+	assert.equal(JSON.parse(confidential.body).client_secret, undefined);
+	assert.equal(JSON.parse(confidential.body).token_endpoint_auth_method, 'none');
+
+	for (const refused of [
+		{ ...TASTY_REGISTRATION, skip_consent: true },
+		{ ...TASTY_REGISTRATION, grant_types: ['client_credentials'] }
+	]) {
+		const reply = await post_json_from_server('/api/auth/oauth2/register', refused);
+		assert.equal(reply.status, 400, reply.body);
+	}
+});
+
+test("a self-registered MCP client signs a person in with consent, PKCE, and the website's MCP resource", async () => {
+	const registered = await post_json_from_server('/api/auth/oauth2/register', TASTY_REGISTRATION);
+	assert.equal(registered.status, 200, registered.body);
+	const { client_id } = JSON.parse(registered.body) as { client_id: string };
+	const cookie = get_cookie(await sign_in(loopback_host, loopback_origin), SESSION_COOKIE).pair;
+
+	const code_verifier = randomBytes(32).toString('base64url');
+	const authorize_query = new URLSearchParams({
+		response_type: 'code',
+		client_id,
+		redirect_uri: TASTY_CALLBACK,
+		scope: MCP_SCOPES,
+		state: 'tasty-state',
+		code_challenge: createHash('sha256').update(code_verifier).digest('base64url'),
+		code_challenge_method: 'S256',
+		resource: WEBSITE_LOCAL_MCP
+	});
+	const authorize = await send(`/api/auth/oauth2/authorize?${authorize_query}`, {
+		host: loopback_host,
+		headers: { cookie }
+	});
+	assert.equal(authorize.status, 302, authorize.body);
+	const consent_url = new URL(String(authorize.headers.location), loopback_origin);
+	assert.equal(consent_url.pathname, '/consent');
+
+	const consent_page = await send(`${consent_url.pathname}${consent_url.search}`, {
+		host: loopback_host,
+		headers: { cookie }
+	});
+	assert.equal(consent_page.status, 200, consent_page.body);
+	assert.match(consent_page.body, /<strong>tasty\.example<\/strong>/);
+
+	const elsewhere = new URLSearchParams(consent_url.search);
+	elsewhere.set('redirect_uri', 'https://evil.example/callback');
+	const elsewhere_page = await send(`/consent?${elsewhere}`, {
+		host: loopback_host,
+		headers: { cookie }
+	});
+	assert.equal(elsewhere_page.status, 400);
+
+	const consent = await post_json(
+		'/api/auth/oauth2/consent',
+		loopback_host,
+		loopback_origin,
+		{ accept: true, scope: MCP_SCOPES, oauth_query: consent_url.search.slice(1) },
+		cookie
+	);
+	assert.equal(consent.status, 200, consent.body);
+	const callback = new URL((JSON.parse(consent.body) as { url: string }).url);
+	assert.equal(`${callback.origin}${callback.pathname}`, TASTY_CALLBACK);
+	assert.equal(callback.searchParams.get('state'), 'tasty-state');
+	const code = callback.searchParams.get('code');
+	assert.ok(code);
+
+	const token = await post_token_form({
+		grant_type: 'authorization_code',
+		code,
+		code_verifier,
+		redirect_uri: TASTY_CALLBACK,
+		client_id,
+		resource: WEBSITE_LOCAL_MCP
+	});
+	assert.equal(token.status, 200, token.body);
+	const tokens = JSON.parse(token.body) as { access_token: string; refresh_token?: string };
+	assert.ok(get_jwt_audiences(tokens.access_token).includes(WEBSITE_LOCAL_MCP));
+	assert.equal(typeof tokens.refresh_token, 'string');
+
+	const refreshed = await post_token_form({
+		grant_type: 'refresh_token',
+		refresh_token: String(tokens.refresh_token),
+		client_id,
+		resource: WEBSITE_LOCAL_MCP
+	});
+	assert.equal(refreshed.status, 200, refreshed.body);
+	const refreshed_tokens = JSON.parse(refreshed.body) as { access_token: string };
+	assert.ok(get_jwt_audiences(refreshed_tokens.access_token).includes(WEBSITE_LOCAL_MCP));
+
+	const other_resource = await post_token_form({
+		grant_type: 'refresh_token',
+		refresh_token: String((JSON.parse(refreshed.body) as { refresh_token?: string }).refresh_token),
+		client_id,
+		resource: 'http://localhost:5741/mcp'
+	});
+	assert.equal(other_resource.status, 400, other_resource.body);
+	assert.match(other_resource.body, /requested resource invalid/);
 });

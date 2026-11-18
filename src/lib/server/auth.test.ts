@@ -5,7 +5,7 @@ import { test } from 'node:test';
 
 import type { D1Database } from '@cloudflare/workers-types';
 
-import { get_cookie_options, get_trusted_origins } from './auth';
+import { create_auth, get_cookie_options, get_trusted_origins } from './auth';
 import type { AuthEnvironment } from './env';
 
 const DB = {} as D1Database;
@@ -69,4 +69,12 @@ test('local cookies are host-only, and `__Secure-` only for a browser on https',
 		get_cookie_options({ ...LOCAL, AUTH_COOKIE_DOMAIN: '.syntax.test', use_secure_cookies: true }),
 		{ useSecureCookies: true }
 	);
+});
+
+test('discovery advertises self-registration for public clients, as MCP clients need', async () => {
+	const metadata = await create_auth(DEPLOYED).api.getOAuthServerConfig();
+
+	assert.equal(metadata.registration_endpoint, 'https://auth.syntax.fm/api/auth/oauth2/register');
+	assert.ok(metadata.token_endpoint_auth_methods_supported?.includes('none'));
+	assert.deepEqual(metadata.code_challenge_methods_supported, ['S256']);
 });

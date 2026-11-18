@@ -31,7 +31,8 @@
 <main>
 	<h1>Authorize {data.client_name}</h1>
 	<p>
-		Signed in as <strong>{data.user.name}</strong>. {data.client_name} is requesting access to:
+		Signed in as <strong>{data.user.name}</strong>. {data.client_name} at
+		<strong>{data.redirect_host}</strong> is requesting access to:
 	</p>
 
 	{#if data.scopes.length}
